@@ -111,13 +111,14 @@ def _refuse_physical_view(source: Any) -> None:
     genuine virtual addresses and are analysed as usual.
     """
     descriptor = getattr(source, "descriptor", None)
-    if getattr(descriptor, "view", None) is not ViewKind.PHYSICAL:
+    view = getattr(descriptor, "view", None)
+    if view is not ViewKind.PHYSICAL:
         return
     raise CapabilityError(
         "heap analysis needs a virtual address space; a physical image view "
         "addresses physical frames. Open a process view of the image instead.",
         category=ErrorCategory.UNSUPPORTED, code="heap.physical_view_unsupported",
-        details={"view_kind": ViewKind.PHYSICAL.value})
+        details={"view_kind": view.value})
 
 
 def _layout_of(source: Any, allocator: str, base_va: Optional[int],

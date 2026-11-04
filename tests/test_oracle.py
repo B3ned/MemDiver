@@ -311,12 +311,18 @@ def test_sandbox_err_with_huge_repr_is_fast_not_a_hang(tmp_path):
         "def build_oracle(cfg):\n"
         "    raise ValueError('X' * 5_000_000)\n",
     )
+    # The timeout is the yardstick, not a guess at machine speed: the fixed cost
+    # here is spawning a Python child (~1-2 s idle, 4+ s on a loaded box), so a
+    # 5 s timeout let load alone push the honest err path into the hang branch.
+    # A starved pipe send blocks until the deadline, so a regression still
+    # takes the full ``timeout_s`` and fails both checks below.
+    timeout_s = 30.0
     t0 = time.monotonic()
     with pytest.raises(OracleLoadError, match="failed to load") as ei:
-        validate_oracle_sandboxed(src, {}, timeout_s=5.0)
+        validate_oracle_sandboxed(src, {}, timeout_s=timeout_s)
     elapsed = time.monotonic() - t0
-    # Fast err path, well under the 5s timeout — and NOT the hang message.
-    assert elapsed < 3.0
+    # Fast err path, well under the timeout — and NOT the hang message.
+    assert elapsed < timeout_s / 2, elapsed
     assert "wall-clock" not in str(ei.value)
 
 

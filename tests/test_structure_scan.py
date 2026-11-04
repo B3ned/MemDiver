@@ -156,9 +156,12 @@ def test_elf_magic_not_searched_under_a_protocol_filter():
 
 def test_random_blob_is_skipped_as_bulk_quickly():
     data = np.random.default_rng(1).integers(0, 256, 4 * MIB, dtype=np.uint8).tobytes()
-    start = time.perf_counter()
+    # CPU time, not wall time: the bound is about the scan's computation (it
+    # runs in-process, single-threaded), and a loaded box stretches wall time
+    # without the scan doing any more work.
+    start = time.process_time()
     result = StructureScanAlgorithm().run(data, _make_context())
-    elapsed = time.perf_counter() - start
+    elapsed = time.process_time() - start
     assert elapsed < 3.0, elapsed  # ~0.15 s measured; generous for CI
     shape = _shape_matches(result)
     assert shape == {}
@@ -234,9 +237,9 @@ def test_large_dump_memory_bounded_and_estimated():
     algo = StructureScanAlgorithm()
     tracemalloc.start()
     try:
-        start = time.perf_counter()
+        start = time.process_time()  # CPU time: load-independent, see above
         result = algo.run(memoryview(buf), _make_context())
-        elapsed = time.perf_counter() - start
+        elapsed = time.process_time() - start
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()

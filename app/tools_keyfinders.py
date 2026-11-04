@@ -37,7 +37,7 @@ import sys
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, cast
 
 from memdiver.app import scan_plan
 from memdiver.app.scan_plan import Plan, Regions, Segment
@@ -110,7 +110,7 @@ def _introspected_parameters(finder: Any) -> List[Dict[str, Any]]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Call) and _is_extra_get(node):
             default = _default_of(node.args[1], module) if len(node.args) > 1 else None
-            found.setdefault(str(node.args[0].value), default)
+            found.setdefault(str(cast(ast.Constant, node.args[0]).value), default)
     return [{"name": n, "default": d, "source": "introspected"} for n, d in found.items()]
 
 

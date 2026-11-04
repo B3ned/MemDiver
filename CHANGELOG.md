@@ -5,6 +5,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.0.7] — 2026-11-04
+
+### Fixed
+- DuckDB 2.0: `case query` again accepts trailing `;`s and leading or trailing comments.
+  2.0 reports comments as tokens and drops leading ones from the parsed statement, which
+  made the single-SELECT guard refuse valid queries. Rewritten statements (`PRAGMA`) are
+  still refused.
+- DuckDB 2.0: ibis array `.map()` / `.filter()` on `Case.table()` no longer fail with
+  "Deprecated lambda arrow"; the notebook connection re-enables the arrow syntax ibis
+  compiles to.
+- `case query` works on DuckDB 1.3 / 1.4 again: results are fetched with
+  `to_arrow_table()` where it exists (1.5+) and `fetch_arrow_table()` before; the
+  declared floor had never been exercised.
+- mypy 2.4: Optional narrowing in `tools_heap`, `tools_isf` and `tools_keyfinders`.
+
+### Changed
+- `duckdb>=1.3.1,<3` (ibis excludes 1.3.0; a new major is tested before it is allowed).
+- CI pins ruff 0.17.3 / mypy 2.4.0 (dev extra `mypy>=2.4,<3`) and adds a
+  `test-duckdb-min` job running the DuckDB-backed tests on the 1.3.1 floor.
+- `app/tools_isf.py` and `app/tools_keyfinders.py` join the mypy typed island.
+
 ## [1.0.6] — 2026-10-27
 
 ### Added

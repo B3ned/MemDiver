@@ -299,24 +299,63 @@ def _glob(case_dir: Path, name: str) -> str:
     return str(case_dir / "tables" / name / "*" / "*.parquet")
 
 
+def _allow_arrow_lambdas(con: Any) -> None:
+    """Let an ibis DuckDB connection run ibis's ``x -> expr`` list lambdas.
+
+    ibis (12.x) compiles array ``.map()`` / ``.filter()`` to the single-arrow
+    form, which DuckDB 2.0 rejects by default. ``lambda x: expr`` keeps
+    working with the setting on; DuckDB builds without it are left alone.
+    """
+    try:
+        con.raw_sql("SET lambda_syntax = 'ENABLE_SINGLE_ARROW'")
+    except duckdb.Error:
+        pass
+
+
 def _quote(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
+
+
+def _fetch_arrow(result: Any) -> pa.Table:
+    """The executed result as an Arrow table on every supported DuckDB.
+
+    ``to_arrow_table()`` arrived in 1.5 and is the only spelling 2.0 keeps;
+    before 1.5 the same call is ``fetch_arrow_table()``.
+    """
+    fetch = getattr(result, "to_arrow_table", None) or result.fetch_arrow_table
+    return fetch()
 
 
 def _without_trailing_semicolons(statement: str) -> str:
     """``statement`` cut before its trailing ``;`` tokens (and anything after them).
 
-    DuckDB's tokenizer skips comments and string contents, so only real ``;``
-    terminators are cut; a comment after the last one goes with it. Token
-    positions are UTF-8 byte offsets, hence the bytes round-trip.
+    DuckDB's tokenizer never reports a ``;`` inside a comment or string, so
+    only real terminators are cut; a comment after the last one goes with it.
+    DuckDB 2.0 reports comments as tokens (1.x skips them), so they are passed
+    over. Token positions are UTF-8 byte offsets, hence the bytes round-trip.
     """
     encoded = statement.encode("utf-8")
     end = len(encoded)
     for position, token_type in reversed(duckdb.tokenize(statement)):
+        if token_type == duckdb.token_type.comment:
+            continue
         if token_type != duckdb.token_type.operator or encoded[position:position + 1] != b";":
             break
         end = position
     return encoded[:end].decode("utf-8").strip()
+
+
+def _from_first_code_token(sql: str) -> str:
+    """``sql`` without its leading whitespace and comments.
+
+    DuckDB 2.0 drops them from ``extract_statements(...).query`` (1.x keeps
+    them), so this is the other faithful form of a single statement.
+    """
+    encoded = sql.encode("utf-8")
+    for position, token_type in duckdb.tokenize(sql):
+        if token_type != duckdb.token_type.comment:
+            return encoded[position:].decode("utf-8")
+    return ""
 
 
 class Case:
@@ -496,14 +535,15 @@ class Case:
 
         The returned text is the statement exactly as DuckDB parsed it, so the
         guarded SQL and the executed SQL are the same. A statement DuckDB rewrote
-        while parsing (``PRAGMA x`` -> ``SELECT * FROM pragma_x()``) is refused.
+        while parsing (``PRAGMA x`` -> ``SELECT * FROM pragma_x()``) is refused;
+        only the leading comments DuckDB 2.0 drops may differ.
         """
         try:
             stmts = duckdb.extract_statements(sql)
         except duckdb.Error as exc:
             raise _invalid(f"SQL does not parse: {exc}", "case.bad_sql") from exc
         if (len(stmts) != 1 or stmts[0].type != duckdb.StatementType.SELECT
-                or stmts[0].query != sql):
+                or stmts[0].query not in (sql, _from_first_code_token(sql))):
             raise _invalid("only a single SELECT statement is allowed",
                            "case.read_only")
         return _without_trailing_semicolons(stmts[0].query)
@@ -525,10 +565,10 @@ class Case:
             # exactly one SELECT, the connection is hardened (case dir only, config
             # locked), values bind as ? params and the LIMIT is an int(). The newline
             # before ')' keeps a trailing ``--`` comment in ``inner`` from eating it.
-            arrow = conn.execute(
+            arrow = _fetch_arrow(conn.execute(
                 f"SELECT * FROM ({inner}\n) AS q LIMIT {int(limit) + 1}",  # nosec B608
                 list(params or ()),
-            ).to_arrow_table()
+            ))
         except duckdb.InterruptException as exc:
             raise CapabilityError(
                 f"query exceeded {timeout_s}s and was cancelled",
@@ -557,5 +597,6 @@ class Case:
                                   category=ErrorCategory.NOT_FOUND,
                                   code="case.no_table")
         con = ibis.duckdb.connect()
+        _allow_arrow_lambdas(con)
         return con.read_parquet(_glob(self.dir, name), table_name=name,
                                 union_by_name=True)

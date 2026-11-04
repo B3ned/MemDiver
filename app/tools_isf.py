@@ -684,7 +684,7 @@ def isf_probe_result(image_path: str, probe: str, *, arch: str = "auto",
     _check_cancel(cancel)
     built, capture = stage["built"], stage["capture"]
     imported = (_feed_draft(probe, built, capture, params, store, draft, author)
-                if store else None)
+                if store is not None and draft else None)
     payload = {"probe": probe, "image": str(image), "capture_id": capture,
                "arch": stage["arch_name"], "arch_source": stage["arch_source"],
                **{k: v for k, v in built.items() if not k.startswith("_")},
@@ -711,9 +711,13 @@ def _probe_stage(image: str, probe: str, arch: str, params: Mapping[str, Any], l
     child (:func:`~memdiver.engine.killable.run_killable`). ``progress`` receives
     ``{"stage", "elapsed_s", "done"}`` as each timed stage starts and ends.
     """
-    def on_stage(name: str, elapsed: float, done: bool) -> None:
-        progress({"stage": name, "elapsed_s": elapsed, "done": done})
-    hook = on_stage if progress is not None else None
+    hook: Optional[Callable[[str, float, bool], None]] = None
+    if progress is not None:
+        report = progress
+
+        def on_stage(name: str, elapsed: float, done: bool) -> None:
+            report({"stage": name, "elapsed_s": elapsed, "done": done})
+        hook = on_stage
     session = _Session(Path(image), arch, params, **({"on_stage": hook} if hook else {}))
     try:
         built = _BUILDERS[probe](session, limit)

@@ -19,6 +19,18 @@ from memdiver.core.variance import ByteClass, compute_variance, classify_varianc
 # --- Variance benchmarks ---
 
 
+def _cpu_timed(fn):
+    """Run ``fn`` once; return ``(result, CPU seconds it took)``.
+
+    CPU time, not wall time: these bounds are about in-process computation, and
+    a loaded box (parallel ``pytest -n auto`` runs) stretches wall time without
+    the code doing any more work.
+    """
+    start = time.process_time()
+    result = fn()
+    return result, time.process_time() - start
+
+
 def _generate_dump_buffers(n_dumps: int, size: int) -> list[bytes]:
     """Generate synthetic dump buffers with mixed byte patterns."""
     rng = np.random.default_rng(42)
@@ -55,9 +67,7 @@ def test_classify_variance_correctness():
 def test_variance_performance():
     """Benchmark: numpy variance on 1MB buffers (5 dumps)."""
     buffers = _generate_dump_buffers(5, 1_000_000)
-    start = time.perf_counter()
-    result = compute_variance(buffers, 1_000_000)
-    elapsed = time.perf_counter() - start
+    result, elapsed = _cpu_timed(lambda: compute_variance(buffers, 1_000_000))
     assert len(result) == 1_000_000
     # Should complete in well under 1 second with numpy
     assert elapsed < 2.0, f"Variance on 5x1MB took {elapsed:.2f}s (expected <2s)"
@@ -66,9 +76,7 @@ def test_variance_performance():
 def test_classify_performance():
     """Benchmark: classify 1M-element variance array."""
     variance = np.random.default_rng(42).uniform(0, 10000, 1_000_000).astype(np.float32)
-    start = time.perf_counter()
-    classes = classify_variance(variance)
-    elapsed = time.perf_counter() - start
+    classes, elapsed = _cpu_timed(lambda: classify_variance(variance))
     assert len(classes) == 1_000_000
     assert elapsed < 0.5, f"Classification of 1M elements took {elapsed:.2f}s"
 
@@ -131,9 +139,8 @@ def test_search_performance():
     correlator = SearchCorrelator()
     source = type("S", (), {"read_all": lambda self: data, "path": "bench.dump"})()
 
-    start = time.perf_counter()
-    hits = correlator.search_all(source, secrets, library="bench", phase="test", run_id=0)
-    elapsed = time.perf_counter() - start
+    hits, elapsed = _cpu_timed(
+        lambda: correlator.search_all(source, secrets, library="bench", phase="test", run_id=0))
 
     assert elapsed < 1.0, f"Search 1MB with 20 secrets took {elapsed:.2f}s"
 

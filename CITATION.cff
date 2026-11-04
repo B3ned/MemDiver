@@ -7,7 +7,7 @@ authors:
     given-names: Daniel
   - family-names: Lambertz
     given-names: Martin
-version: 1.0.6
+version: 1.0.7
 license: Apache-2.0
 repository-code: "https://github.com/MemorySlice/MemDiver"
 url: "https://memoryslice.github.io/MemDiver/"

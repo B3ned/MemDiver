@@ -581,8 +581,14 @@ def test_elapsed_s_excludes_the_per_run_keylog_parse(tmp_path, monkeypatch):
     wall = time.perf_counter() - wall_start
 
     assert wall >= 0.25, "the injected parse delay really did happen"
-    assert result.elapsed_s < 0.25, (
-        "elapsed_s must exclude the keylog parse; it timed the whole call")
+    # Relative to this call's own wall time, not an absolute budget: the parse
+    # slept >= 0.25 s inside ``wall``, so a scan timer that excludes it leaves
+    # at least that much (minus one rounding step) unaccounted for, however
+    # slowly a loaded box ran the scan itself.
+    rounding = 10 ** -ELAPSED_PRECISION
+    assert result.elapsed_s <= wall - 0.25 + rounding, (
+        "elapsed_s must exclude the keylog parse; it timed the whole call",
+        result.elapsed_s, wall)
 
 
 def test_elapsed_s_is_rounded_and_never_negative(tmp_path):

@@ -6,7 +6,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from memdiver.analysis.case import Case, _check_name, snake_case_columns
+from memdiver.analysis.case import Case, _check_name, _fetch_arrow, snake_case_columns
 from memdiver.analysis.record import AnalysisEntry
 from memdiver.core.service_errors import CapabilityError, ErrorCategory
 
@@ -181,6 +181,7 @@ def test_group_by_image(case):
 @pytest.mark.parametrize("sql", [
     "INSERT INTO t VALUES (1)", "COPY t TO '/tmp/x.csv'",
     "ATTACH '/tmp/x.db'", "SET threads=1", "PRAGMA version",
+    "/* c */ PRAGMA version", "-- c\nATTACH '/tmp/x.db'",
     "CREATE TABLE z (a int)", "SELECT 1; SELECT 2", "SELECT 1; DROP VIEW t",
     "", "DROP VIEW t",
 ])
@@ -211,6 +212,10 @@ def test_statement_guard_comments_cannot_hide_a_second_statement(case, sql):
     "/* block */ SELECT 1 AS x /* trailing */",
     "/* block */ SELECT 1 AS x; /* after */",
     "SELECT 1 AS x -- one\n-- two\n;  -- three",
+    # DuckDB 2.0 tokenizes comments and drops leading ones from the parsed query
+    "SELECT 1 AS x /* c */ ;",
+    "  SELECT 1 AS x  ",
+    "\n-- lead\n  SELECT 1 AS x;",
 ])
 def test_trailing_semicolons_and_comments_are_accepted(case, sql):
     assert case.query(sql).table.to_pylist() == [{"x": 1}]
@@ -297,3 +302,18 @@ def test_query_binds_positional_params_without_formatting(tmp_path):
     assert hit.table.column("addr").to_pylist() == [0xFFFFFFFF82000A20]
     none = case.query("SELECT addr FROM t WHERE capture_id = ?", params=["cap' OR 1=1 --"])
     assert none.table.num_rows == 0
+
+
+class _NewResult:
+    def to_arrow_table(self):
+        return "new"
+
+
+class _OldResult:
+    def fetch_arrow_table(self):
+        return "old"
+
+
+@pytest.mark.parametrize("result, expected", [(_NewResult(), "new"), (_OldResult(), "old")])
+def test_fetch_arrow_uses_the_spelling_the_duckdb_version_has(result, expected):
+    assert _fetch_arrow(result) == expected
