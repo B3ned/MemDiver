@@ -83,6 +83,9 @@ export function readableFailure(err: unknown): string {
       for (const field of [envelope.error, envelope.detail, envelope.message]) {
         if (typeof field === "string" && field.trim() !== "") return field.trim();
       }
+      // FastAPI `detail` may itself be a `{code, message}` object (e.g. the agent models listing).
+      const nested = (envelope.detail as { message?: unknown } | null)?.message;
+      if (typeof nested === "string" && nested.trim() !== "") return nested.trim();
     }
   } catch {
     // Not JSON after all -- the raw text is the best we have.

@@ -14,6 +14,7 @@ from .contracts import (
     Emit,
     PermissionGate,
 )
+from .system_prompt import with_scope
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,7 @@ class ChatSession:
         self._task: Optional["asyncio.Task[None]"] = None
         self._closed = False
         self._close_task: Optional["asyncio.Task[None]"] = None
+        self._scope_sent = False
 
     async def _status(self, state: str) -> None:
         await self._emit(ChatEvent("status", {"state": state}))
@@ -88,12 +90,20 @@ class ChatSession:
         elif self.running:
             await self._error("busy", "a turn is already running")
         else:
-            self._task = asyncio.get_running_loop().create_task(self._run_turn(text))
+            self._task = asyncio.get_running_loop().create_task(
+                self._run_turn(self._first_with_scope(text)))
+
+    def _first_with_scope(self, text: str) -> str:
+        """The scope note rides each message until one was sent successfully."""
+        if self._scope_sent:
+            return text
+        return with_scope(text, self._spec.scope_note)
 
     async def _run_turn(self, text: str) -> None:
         await self._status("running")
         try:
             await self._backend.send(text)
+            self._scope_sent = True  # only once a send got through without raising
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

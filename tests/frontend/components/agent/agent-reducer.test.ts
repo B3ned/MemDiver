@@ -44,4 +44,11 @@ describe("agent chat reducer", () => {
     expect(v.result).toEqual({ stop_reason: "end_turn", is_error: false });
     expect(v.items).toEqual([{ kind: "error", code: "boom", message: "bad" }]);
   });
+
+  it("passes cost_known through only when the event carries a boolean", () => {
+    const ev = { type: "usage", turns: 1, max_turns: 8, cost_estimate_usd: 0, max_budget_usd: 0.5 };
+    expect(run([{ ...ev, cost_known: false }]).usage?.cost_known).toBe(false);
+    expect(run([{ ...ev, cost_known: true }]).usage?.cost_known).toBe(true);
+    expect(run([{ ...ev, cost_known: "no" }]).usage).not.toHaveProperty("cost_known");
+  });
 });

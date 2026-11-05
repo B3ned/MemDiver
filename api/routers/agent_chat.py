@@ -10,9 +10,11 @@ refusal as dependencies) and ``ws_router`` (the WebSocket, which cannot take
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import logging
-from typing import Any, Dict, List, Optional
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Response, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
@@ -23,9 +25,17 @@ from memdiver.api.services import agent_chat as chats
 from memdiver.api.services import agent_playbooks
 from memdiver.api.user_prefs import read_pref, write_pref
 from memdiver.app.agent_chat import contracts as c
+from memdiver.app.agent_chat.providers import (
+    KIND_OPENAI_COMPAT, PROVIDERS, TOOL_SET_CHOICES, provider_availability,
+    provider_public_info, resolve_endpoint)
 from memdiver.app.agent_chat.settings_store import load_settings, save_settings
+from memdiver.core.install_hints import missing_package_message
 
 logger = logging.getLogger("memdiver.api.routers.agent_chat")
+
+#: ``GET {base_url}/models`` of a provider: bounded so a dead endpoint cannot hang the UI.
+MODELS_TIMEOUT_SECONDS = 5.0
+MAX_LISTED_MODELS = 500
 
 
 def _require_safe_bind() -> None:
@@ -61,7 +71,12 @@ def _settings_body() -> dict:
         "settings": settings.to_dict(),
         "defaults": c.AgentSettings().to_dict(),
         "limits": {name: list(bounds) for name, bounds in c.LIMITS.items()},
-        "choices": {"model": list(c.MODEL_CHOICES), "effort": list(c.EFFORT_CHOICES)},
+        "choices": {
+            "model": list(c.MODEL_CHOICES), "effort": list(c.EFFORT_CHOICES),
+            "provider": list(c.PROVIDER_CHOICES),
+            "providers": [provider_public_info(p, os.environ) for p in PROVIDERS.values()],
+            "tool_set": list(TOOL_SET_CHOICES),
+        },
         "warning": warning,
     }
 
@@ -79,6 +94,62 @@ def put_agent_settings(changes: Dict[str, Any]) -> dict:
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return _settings_body()
+
+
+# -- provider models ---------------------------------------------------------------------
+
+
+def _models_client(base_url: str, api_key: str) -> Any:
+    """The OpenAI-compatible client of the models listing (tests swap this factory)."""
+    from openai import AsyncOpenAI
+
+    return AsyncOpenAI(base_url=base_url, api_key=api_key,
+                       timeout=MODELS_TIMEOUT_SECONDS, max_retries=0)
+
+
+def _compat_endpoint(provider_id: str) -> Tuple[str, str]:
+    """``(base_url, api_key)`` of a known, available OpenAI-compatible preset, else 4xx."""
+    preset = PROVIDERS.get(provider_id)
+    if preset is None or preset.kind != KIND_OPENAI_COMPAT:
+        raise HTTPException(status_code=404,
+                            detail="unknown OpenAI-compatible provider")
+    available, reason = provider_availability(preset, os.environ)
+    if not available:
+        raise HTTPException(status_code=409, detail=reason)
+    return resolve_endpoint(preset, os.environ)
+
+
+async def _list_model_ids(base_url: str, api_key: str) -> List[str]:
+    import openai
+
+    client = _models_client(base_url, api_key)
+    try:
+        page = await client.models.list()
+        return sorted({str(m.id) for m in page.data})[:MAX_LISTED_MODELS]
+    except openai.APIConnectionError as exc:  # includes timeouts
+        raise HTTPException(status_code=503, detail={
+            "code": "provider_unreachable",
+            "message": "the provider did not answer"}) from exc
+    except openai.APIStatusError as exc:
+        status = exc.status_code
+        message = ("the provider refused the API key" if status in (401, 403)
+                   else f"the provider answered HTTP {status}")
+        raise HTTPException(status_code=502, detail={
+            "code": "provider_error", "message": message}) from exc
+    finally:
+        await client.close()
+
+
+@router.post("/api/agent/providers/{provider_id}/models")
+async def list_provider_models(provider_id: str) -> dict:
+    """Model ids the provider serves. A POST so the cross-site guard covers it (it makes a
+    key-bearing outbound call); the key and base URL never appear in the answer."""
+    base_url, api_key = _compat_endpoint(provider_id)
+    if importlib.util.find_spec("openai") is None:
+        raise HTTPException(status_code=503, detail={
+            "code": "agent.unavailable",
+            "message": missing_package_message("openai", "agent")})
+    return {"models": await _list_model_ids(base_url, api_key)}
 
 
 # -- playbooks ------------------------------------------------------------------------------

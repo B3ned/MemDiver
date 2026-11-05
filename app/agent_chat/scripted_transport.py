@@ -29,84 +29,21 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from contextlib import AsyncExitStack
-from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from claude_agent_sdk import Transport
 
 from memdiver.app.agent_chat.contracts import MCP_SERVER_NAME, TOOL_PREFIX
+from memdiver.app.agent_chat.mcp_tools import McpToolClient, load_script
+
+__all__ = ["EXHAUSTED_TEXT", "McpToolClient", "ScriptedCliTransport", "load_script"]
 
 EXHAUSTED_TEXT = "(script exhausted)"
 _CHUNK = 12  # characters per scripted text delta
-_CLOSE_TIMEOUT = 10.0
 
 
-def load_script(path: str) -> Dict[str, Any]:
-    """Read and minimally validate a script file."""
-    script = json.loads(Path(path).read_text(encoding="utf-8"))
-    turns = script.get("turns") if isinstance(script, dict) else None
-    if not isinstance(turns, list) or not all(isinstance(t, list) for t in turns):
-        raise ValueError('script must be {"turns": [[step, ...], ...]}')
-    return script
-
-
-class _McpWorker:
-    """Owns the MCP stdio client in ONE task (anyio scopes must exit where they entered)."""
-
-    def __init__(self, server: Dict[str, Any]) -> None:
-        self._server = server
-        self._queue: "asyncio.Queue[Any]" = asyncio.Queue()
-        self._task: Optional["asyncio.Task[None]"] = None
-        self._ready: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
-
-    async def call(self, name: str, arguments: Dict[str, Any]) -> tuple[str, bool]:
-        """``(text, is_error)`` of one real tool call."""
-        if self._task is None:
-            self._task = asyncio.create_task(self._run())
-        await self._ready
-        future: "asyncio.Future[Any]" = asyncio.get_running_loop().create_future()
-        await self._queue.put((name, arguments, future))
-        return await future
-
-    async def close(self) -> None:
-        if self._task is None:
-            return
-        await self._queue.put(None)
-        try:
-            await asyncio.wait_for(self._task, _CLOSE_TIMEOUT)
-        except (asyncio.TimeoutError, Exception):
-            self._task.cancel()
-
-    async def _run(self) -> None:
-        from mcp import ClientSession, StdioServerParameters
-        from mcp.client.stdio import stdio_client
-
-        params = StdioServerParameters(
-            command=self._server["command"], args=list(self._server.get("args", [])),
-            env=self._server.get("env") or None)
-        try:
-            async with AsyncExitStack() as stack:
-                read, write = await stack.enter_async_context(stdio_client(params))
-                session = await stack.enter_async_context(ClientSession(read, write))
-                await session.initialize()
-                self._ready.set_result(None)
-                while (item := await self._queue.get()) is not None:
-                    await self._serve(session, *item)
-        except Exception as exc:  # startup failure: unblock waiters
-            if not self._ready.done():
-                self._ready.set_exception(exc)
-
-    @staticmethod
-    async def _serve(session: Any, name: str, arguments: Dict[str, Any],
-                     future: "asyncio.Future[Any]") -> None:
-        try:
-            result = await session.call_tool(name, arguments)
-            text = "".join(getattr(b, "text", "") for b in result.content)
-            is_error = bool(getattr(result, "is_error", getattr(result, "isError", False)))
-            future.set_result((text, is_error))
-        except Exception as exc:
-            future.set_result((f"{type(exc).__name__}: {exc}", True))
+#: Backward-compatible name of the MCP worker (now :class:`mcp_tools.McpToolClient`).
+_McpWorker = McpToolClient
 
 
 class ScriptedCliTransport(Transport):
@@ -118,7 +55,7 @@ class ScriptedCliTransport(Transport):
         self._allowed: List[str] = []
         self._max_turns: Optional[int] = None
         self._mcp_server: Optional[Dict[str, Any]] = None
-        self._worker: Optional[_McpWorker] = None
+        self._worker: Optional[McpToolClient] = None
         self._pending: Dict[str, "asyncio.Future[Dict[str, Any]]"] = {}
         self._tasks: set = set()
         self._current: Optional["asyncio.Task[None]"] = None
@@ -169,10 +106,8 @@ class ScriptedCliTransport(Transport):
         """Hard stop (escalation of a close that hung): cancel the MCP worker so the
         stdio client tears its child down, without the graceful drain."""
         self._ready = False
-        worker = self._worker
-        if worker is not None and worker._task is not None:
-            worker._task.cancel()
-            await asyncio.gather(worker._task, return_exceptions=True)
+        if self._worker is not None:
+            await self._worker.kill()
         self._out.put_nowait(None)
 
     # -- what the SDK writes to "the CLI's stdin" -----------------------------------------
@@ -275,7 +210,7 @@ class ScriptedCliTransport(Transport):
         if self._mcp_server is None:
             return f"no '{MCP_SERVER_NAME}' MCP server configured", True
         if self._worker is None:
-            self._worker = _McpWorker(self._mcp_server)
+            self._worker = McpToolClient(self._mcp_server)
         try:
             return await self._worker.call(full_name[len(TOOL_PREFIX):], arguments)
         except Exception as exc:

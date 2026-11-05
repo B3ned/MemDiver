@@ -152,8 +152,13 @@ file does not apply to them.
 | `MEMDIVER_VOL3_BIN` | unset | Explicit `vol` / `vol.py` launcher used to run emitted Volatility 3 plugins. Checked before `vol` and `vol.py` on `PATH`. A `vol_bin` parameter on a request beats it. | `engine/vol3_subproc.py` |
 | `MEMDIVER_VOL3_PYTHON` | unset | Interpreter that runs a `vol.py` script (the checkout's own venv). Unset means MemDiver's own interpreter, with a warning. A `vol_python` parameter beats it. | `engine/vol3_subproc.py` |
 | `MEMDIVER_MCP_RESULT_BUDGET` | unset (off) | Opt-in cap in bytes (min 1024) on each MCP tool result; larger results are truncated with a `_result_budget` marker. See [](mcp_reference.md). | `mcp_server/result_budget.py` |
-| `MEMDIVER_AGENT_BACKEND` | `sdk` | Backend of the in-UI agent chat: `sdk` (real model, needs `memdiver[agent]` and server-side credentials) or `scripted` (no model, demo/test). See [](agent_chat.md). | `api/services/agent_chat.py` |
-| `MEMDIVER_AGENT_SCRIPT` | unset | Script JSON (`{"turns": [[step, ...], ...]}`) played by the `scripted` agent backend; required for it. | `api/services/agent_chat.py` |
+| `MEMDIVER_AGENT_BACKEND` | `sdk` | Backend of the in-UI agent chat: `sdk` (real model of the selected provider, needs `memdiver[agent]` and server-side credentials), `scripted` (no model, demo/test, through the Claude runtime) or `scripted-compat` (no model, demo/test, through the OpenAI-compatible loop; needs neither the SDK nor `openai`). See [](agent_chat.md). | `api/services/agent_chat.py` |
+| `MEMDIVER_AGENT_SCRIPT` | unset | Script JSON (`{"turns": [[step, ...], ...]}`) played by the `scripted` and `scripted-compat` agent backends; required for them. | `api/services/agent_chat.py` |
+| `OPENAI_API_KEY` | unset | API key of the agent chat's `openai` provider; the provider is unavailable without it. Never sent to the browser or the MCP child. | `app/agent_chat/providers.py` |
+| `DEEPSEEK_API_KEY` | unset | API key of the agent chat's `deepseek` provider; the provider is unavailable without it. Never sent to the browser or the MCP child. | `app/agent_chat/providers.py` |
+| `VLLM_API_KEY` | unset | Optional API key for the agent chat's `vllm` provider (`http://127.0.0.1:8000/v1`), when the vLLM server was started with `--api-key`. | `app/agent_chat/providers.py` |
+| `MEMDIVER_AGENT_OPENAI_BASE_URL` | unset | Base URL of the agent chat's `custom` OpenAI-compatible provider (e.g. `http://gpu-box:8000/v1`); the provider is only offered when this is set. Server-side only: the browser can never set a URL, because the server attaches the API key to it. | `app/agent_chat/providers.py` |
+| `MEMDIVER_AGENT_OPENAI_API_KEY` | unset | Optional API key sent to `MEMDIVER_AGENT_OPENAI_BASE_URL`. | `app/agent_chat/providers.py` |
 | `MEMDIVER_DATASET_ROOT` | unset | Also read by the Marimo notebook app (`run.py`) to preselect a dataset. | `run.py` |
 | `MEMDIVER_LANG` | `en` | Locale of the Marimo UI strings (`ui/locales/<lang>.json`); anything after a `.` is dropped (`de.UTF-8` → `de`). Unknown locales fall back to `en`. Does not affect the React web UI. | `ui/locales.py` |
 
@@ -163,6 +168,12 @@ Other variables that matter:
   `$XDG_DATA_HOME/memdiver` instead of `~/.memdiver` (`core/constants.py:memdiver_home`).
   This is where the user-local prefs file, sessions, the project DB and the
   default oracle directory live.
+- **`OLLAMA_CONTEXT_LENGTH`** — not read by MemDiver, but set it on the **Ollama
+  server** (e.g. `32768`) when the agent chat uses the `ollama` provider: the
+  OpenAI-compatible API cannot raise the context window per request, and a too-small
+  window makes MemDiver refuse the request with `agent.context_truncated`
+  before sending it. vLLM likewise needs
+  `--enable-auto-tool-choice --tool-call-parser <parser>`. See [](agent_chat.md).
 - **`MEMDIVER_FIXTURE_ROOT`** — read only by developer scripts under `scripts/`
   (`ground-truth-run0001.py`, `precompute_pipeline_fixtures.py`) to find a local
   dataset. The app never reads it.

@@ -8,7 +8,8 @@
     "installHint": "Install it with:",
     "noCredentials": "No model credentials were found on the server. Set ANTHROPIC_API_KEY, or configure Bedrock or Vertex, in the environment of the MemDiver server and restart it. Keys are never entered in the browser.",
     "scriptedBadge": "Demo/test backend — no model",
-    "unavailable": "The agent is unavailable."
+    "unavailable": "The agent is unavailable.",
+    "provider": "Provider: {{provider}}"
   },
   "settings": {
     "title": "Settings",
@@ -24,7 +25,22 @@
     "saved": "Settings saved.",
     "reset": "Reset to defaults",
     "warning": "The saved settings were invalid and have been replaced by the defaults; save to confirm.",
-    "saveFailed": "Could not save: {{error}}"
+    "saveFailed": "Could not save: {{error}}",
+    "provider": "Provider",
+    "providerUnavailable": "{{id}} (unavailable: {{reason}})",
+    "modelRequired": "Enter a model name.",
+    "loadModels": "Load models",
+    "loadingModels": "Loading...",
+    "loadModelsFailed": "Could not load models: {{error}}",
+    "modelsLoaded": "{{count}} model(s) loaded; pick one from the suggestions.",
+    "effortUnsupported": "This provider does not support an effort setting.",
+    "toolSet": "Tool set",
+    "toolSetDefault": "default ({{value}})",
+    "toolSetHint": "Smaller tool sets suit models with short context windows.",
+    "priceInput": "Input price (USD per 1M tokens)",
+    "priceOutput": "Output price (USD per 1M tokens)",
+    "priceDefault": "Empty uses the provider default: {{value}}",
+    "priceInvalid": "Enter a number between 0 and {{high}}, or leave it empty."
   },
   "chat": {
     "start": "Start chat",
@@ -94,6 +110,7 @@
     "turns": "Turns {{turns}}/{{max}}",
     "cost": "Est. cost ${{cost}} / ${{max}}",
     "estimated": "estimated",
-    "aria": "Chat usage"
+    "aria": "Chat usage",
+    "costUnknown": "cost n/a (local model)"
   }
 }

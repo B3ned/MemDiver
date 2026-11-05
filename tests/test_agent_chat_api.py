@@ -41,7 +41,8 @@ def env(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("MEMDIVER_ALLOWED_ROOTS", raising=False)
     monkeypatch.delenv("MEMDIVER_API_TOKEN", raising=False)
     monkeypatch.delenv("MEMDIVER_HOST", raising=False)
-    for name in (*chats.CREDENTIAL_VARS, *chats.CLOUD_PROVIDER_FLAGS):
+    for name in (*chats.CREDENTIAL_VARS, *chats.CLOUD_PROVIDER_FLAGS,
+                 *chats.PROVIDER_KEY_VARS, "MEMDIVER_AGENT_OPENAI_BASE_URL"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv(chats.BACKEND_ENV, "scripted")
     get_settings.cache_clear()
@@ -112,7 +113,13 @@ def test_status_sdk_missing_gives_install_hint(client, monkeypatch):
 def test_settings_get_defaults_and_shape(client):
     body = client.get("/api/agent/settings").json()
     assert body["settings"] == body["defaults"] == c.AgentSettings().to_dict()
-    assert body["choices"] == {"model": list(c.MODEL_CHOICES), "effort": list(c.EFFORT_CHOICES)}
+    choices = body["choices"]
+    assert choices["model"] == list(c.MODEL_CHOICES)
+    assert choices["effort"] == list(c.EFFORT_CHOICES)
+    assert choices["provider"] == list(c.PROVIDER_CHOICES)
+    assert [p["id"] for p in choices["providers"]] == list(c.PROVIDER_CHOICES)
+    assert choices["tool_set"] == ["full", "compact", "minimal"]
+    assert not any("url" in key or "key" in key for p in choices["providers"] for key in p)
     assert body["limits"]["max_turns"] == [1, 200]
     assert body["warning"] is False
 
@@ -224,6 +231,20 @@ def test_chat_spec_confines_the_mcp_child(env, monkeypatch):
     assert c.TOOL_PREFIX + "case_manifest" in spec.allowed_tools
     assert c.TOOL_PREFIX + "annotations_add" not in spec.allowed_tools
     assert spec.tool_access["capture_dump"] == "never"
+
+
+def test_chat_spec_tells_the_model_its_scope(env):
+    """Regression (live llama3.3 run): the model was never told the case/dump paths and
+    called case_manifest with an invented '/path/to/case/directory'."""
+    case = _make_case(env)
+    dump = env / "d" / "x.dump"
+    dump.parent.mkdir()
+    dump.write_bytes(b"\0" * 16)
+    spec = chats.build_spec(case, [str(dump)], chats.tool_access_map())
+    assert f"case_dir: {json.dumps(str(Path(case).resolve()))}" in spec.scope_note
+    assert f"dump_path: {json.dumps(str(dump.resolve()))}" in spec.scope_note
+    assert str(Path(case).resolve()) not in spec.system_prompt  # prompt stays byte-stable
+    assert chats.build_spec(None, [], chats.tool_access_map()).scope_note == ""
 
 
 def test_chat_spec_uses_configured_sandbox_roots(env, monkeypatch):
@@ -420,3 +441,179 @@ def test_ws_delete_closes_the_socket(client, env, monkeypatch):
             while True:
                 tail.append(ws.receive_json())
     assert {"type": "status", "state": "closed"} in tail
+
+
+# -- providers (OpenAI-compatible presets) -----------------------------------------------
+
+PROVIDER_SECRET = "sk-secret-test"
+
+
+def test_status_lists_providers_without_urls_or_keys(client, monkeypatch, env):
+    _write_script(env, monkeypatch, [[{"text": "hi"}]])
+    monkeypatch.setenv("DEEPSEEK_API_KEY", PROVIDER_SECRET)
+    response = client.get("/api/agent/status")
+    body = response.json()
+    assert body["provider"] == "anthropic"
+    by_id = {p["id"]: p for p in body["providers"]}
+    assert by_id["deepseek"]["available"] is True and by_id["openai"]["available"] is False
+    assert PROVIDER_SECRET not in response.text and "api.deepseek.com" not in response.text
+
+
+def test_status_compat_provider_missing_key_names_the_variable(client, monkeypatch):
+    monkeypatch.setenv(chats.BACKEND_ENV, "sdk")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+    assert client.put("/api/agent/settings", json={"provider": "deepseek"}).status_code == 200
+    response = client.get("/api/agent/status")
+    body = response.json()
+    assert body["provider"] == "deepseek" and body["available"] is False
+    assert body["credentials"] is False
+    assert "DEEPSEEK_API_KEY" in body["reason"] and SECRET not in response.text
+
+
+def test_status_compat_provider_with_key_is_available(client, monkeypatch):
+    pytest.importorskip("openai")
+    monkeypatch.setenv(chats.BACKEND_ENV, "sdk")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", PROVIDER_SECRET)
+    client.put("/api/agent/settings", json={"provider": "deepseek"})
+    response = client.get("/api/agent/status")
+    assert response.json()["available"] is True and response.json()["credentials"] is True
+    assert PROVIDER_SECRET not in response.text
+
+
+def test_status_compat_provider_without_openai_gives_install_hint(client, monkeypatch):
+    monkeypatch.setenv(chats.BACKEND_ENV, "sdk")
+    client.put("/api/agent/settings", json={"provider": "ollama"})
+    real = chats.importlib.util.find_spec
+    monkeypatch.setattr(chats.importlib.util, "find_spec",
+                        lambda name: None if name == "openai" else real(name))
+    body = client.get("/api/agent/status").json()
+    assert body["available"] is False and "agent" in body["install_hint"]
+    assert body["credentials"] is True  # ollama takes no key
+
+
+def test_status_scripted_compat_needs_neither_sdk_nor_openai(client, monkeypatch, env):
+    _write_script(env, monkeypatch, [[{"text": "hi"}]])
+    monkeypatch.setenv(chats.BACKEND_ENV, "scripted-compat")
+    monkeypatch.setattr(chats.importlib.util, "find_spec", lambda name: None)
+    body = client.get("/api/agent/status").json()
+    assert body["available"] is True and body["backend"] == "scripted-compat"
+
+
+def test_status_scripted_compat_without_script_is_unavailable(client, monkeypatch):
+    monkeypatch.setenv(chats.BACKEND_ENV, "scripted-compat")
+    body = client.get("/api/agent/status").json()
+    assert body["available"] is False and "MEMDIVER_AGENT_SCRIPT" in body["reason"]
+
+
+def test_custom_provider_without_prices_is_refused(client, monkeypatch):
+    """Regression: ``custom`` defaults to prices (0, 0), so max_budget_usd never tripped."""
+    pytest.importorskip("openai")
+    monkeypatch.setenv(chats.BACKEND_ENV, "sdk")
+    monkeypatch.setenv("MEMDIVER_AGENT_OPENAI_BASE_URL", "http://127.0.0.1:9/v1")
+    assert client.put("/api/agent/settings",
+                      json={"provider": "custom", "model": "m1"}).status_code == 200
+    body = client.get("/api/agent/status").json()
+    assert body["available"] is False and "'custom' provider" in body["reason"]
+    created = client.post("/api/agent/chats", json={})
+    assert created.status_code == 409
+    assert created.json()["code"] == "agent.prices_required"
+    client.put("/api/agent/settings", json={"price_output_per_mtok": 1.0})
+    assert client.get("/api/agent/status").json()["available"] is True
+
+
+@pytest.mark.parametrize("changes", [
+    {"base_url": "http://evil.example/v1"}, {"api_key": "sk-x"},
+    {"provider": "nope"}, {"tool_set": "huge"}, {"price_input_per_mtok": -1},
+])
+def test_settings_put_refuses_endpoint_and_bad_provider_fields(client, changes):
+    response = client.put("/api/agent/settings", json=changes)
+    assert response.status_code == 422
+    assert client.get("/api/agent/settings").json()["settings"] == c.AgentSettings().to_dict()
+
+
+def test_settings_put_provider_switch_resets_model(client):
+    body = client.put("/api/agent/settings", json={"provider": "ollama"}).json()
+    assert body["settings"]["provider"] == "ollama"
+    assert body["settings"]["model"] == "llama3.3"
+
+
+def _mock_models(monkeypatch, handler) -> list:
+    """Route the models client through ``handler``; returns the seen requests."""
+    openai = pytest.importorskip("openai")
+    import httpx
+
+    from memdiver.api.routers import agent_chat as router_mod
+
+    seen: list = []
+
+    def recorder(request):
+        seen.append(request)
+        return handler(request)
+
+    def factory(base_url, api_key):
+        return openai.AsyncOpenAI(
+            base_url=base_url, api_key=api_key, max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(recorder)))
+
+    monkeypatch.setattr(router_mod, "_models_client", factory)
+    return seen
+
+
+def _models_payload(*ids):
+    import httpx
+
+    return httpx.Response(200, json={"object": "list", "data": [
+        {"id": i, "object": "model", "created": 0, "owned_by": "x"} for i in ids]})
+
+
+@pytest.mark.parametrize("provider_id", ["nope", "anthropic", "..%2Fetc"])
+def test_provider_models_refuses_unknown_and_sdk_ids(client, provider_id):
+    response = client.post(f"/api/agent/providers/{provider_id}/models")
+    assert 400 <= response.status_code < 500
+
+
+def test_provider_models_lists_sorted_ids(client, monkeypatch):
+    seen = _mock_models(monkeypatch, lambda r: _models_payload("qwen3", "llama3.3"))
+    response = client.post("/api/agent/providers/ollama/models")
+    assert response.status_code == 200 and response.json() == {"models": ["llama3.3", "qwen3"]}
+    assert str(seen[0].url) == "http://127.0.0.1:11434/v1/models"
+
+
+def test_provider_models_unavailable_names_variable_only(client, monkeypatch):
+    seen = _mock_models(monkeypatch, lambda r: _models_payload("x"))
+    response = client.post("/api/agent/providers/deepseek/models")
+    assert response.status_code == 409 and "DEEPSEEK_API_KEY" in response.text
+    assert seen == []
+
+
+def test_provider_models_sends_key_but_never_echoes_it(client, monkeypatch):
+    import httpx
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", PROVIDER_SECRET)
+    seen = _mock_models(monkeypatch, lambda r: httpx.Response(
+        401, json={"error": {"message": f"bad key {PROVIDER_SECRET}"}}))
+    response = client.post("/api/agent/providers/deepseek/models")
+    assert response.status_code == 502
+    assert seen[0].headers["authorization"] == f"Bearer {PROVIDER_SECRET}"
+    assert PROVIDER_SECRET not in response.text and "deepseek.com" not in response.text
+
+
+def test_provider_models_unreachable_is_503(client, monkeypatch):
+    import httpx
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", PROVIDER_SECRET)
+
+    def refuse(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    _mock_models(monkeypatch, refuse)
+    response = client.post("/api/agent/providers/deepseek/models")
+    assert response.status_code == 503 and "provider_unreachable" in response.text
+    assert PROVIDER_SECRET not in response.text
+
+
+def test_provider_models_cross_site_post_is_refused(client, monkeypatch):
+    seen = _mock_models(monkeypatch, lambda r: _models_payload("x"))
+    response = client.post("/api/agent/providers/ollama/models",
+                           headers={"Origin": "https://evil.example"})
+    assert response.status_code == 403 and seen == []

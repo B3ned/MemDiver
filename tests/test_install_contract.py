@@ -72,6 +72,7 @@ _IMPORT_TO_DISTRIBUTION = {
     "memslicer": "memslicer",
     "nacl": "PyNaCl",
     "numpy": "numpy",
+    "openai": "openai",
     "oqs": "liboqs-python",
     "plotly": "plotly",
     "polars": "polars",

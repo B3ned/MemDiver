@@ -56,7 +56,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     catch (e) { set({ statusError: readableFailure(e) }); }
   },
   loadSettings: async () => { set({ bundle: await getAgentSettings() }); },
-  saveSettings: async (changes) => { set({ bundle: await putAgentSettings(changes) }); },
+  // Status is provider-aware: refetch it after a save so the banner and Start chat follow
+  // the saved provider. loadStatus never throws, so a status failure cannot fail the save.
+  saveSettings: async (changes) => {
+    set({ bundle: await putAgentSettings(changes) });
+    await get().loadStatus();
+  },
   startChat: async (body) => {
     await get().endChat();
     set({ ...EMPTY_CHAT, state: "starting", connectionError: null });

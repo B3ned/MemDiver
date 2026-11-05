@@ -11,15 +11,27 @@ never imports ``api/`` or ``mcp_server/``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Protocol
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Protocol, Tuple
+
+from .providers import (
+    PROVIDER_IDS, PROVIDERS, TOOL_SET_CHOICES, get_preset, is_valid_price,
+)
 
 #: SDK tool-name prefix of the MemDiver MCP server (``mcp__<server>__<tool>``).
 MCP_SERVER_NAME = "memdiver"
 TOOL_PREFIX = f"mcp__{MCP_SERVER_NAME}__"
 
-DEFAULT_MODEL = "claude-opus-5-5"
-MODEL_CHOICES = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")
+#: The Claude models of the ``anthropic`` preset (single source: ``providers``).
+DEFAULT_MODEL = PROVIDERS["anthropic"].default_model
+MODEL_CHOICES = PROVIDERS["anthropic"].model_suggestions
+PROVIDER_CHOICES = PROVIDER_IDS
+#: Model names of the OpenAI-compatible providers (free-form, but no spaces or quotes).
+#: Always applied with ``fullmatch`` (``$`` alone would admit a trailing newline).
+COMPAT_MODEL_PATTERN = re.compile(r"[A-Za-z0-9._:/@-]{1,128}")
+#: Settings a provider switch resets to the new preset's defaults unless also changed.
+_PROVIDER_SCOPED = ("tool_set", "price_input_per_mtok", "price_output_per_mtok")
 EFFORT_CHOICES = ("low", "medium", "high")
 
 #: Inclusive bounds a user may set; the defaults below are deliberately LOW.
@@ -40,11 +52,23 @@ class AgentSettings:
     max_budget_usd: float = 0.50
     #: Per-tool-result cap passed to the MCP child (``MEMDIVER_MCP_RESULT_BUDGET``).
     result_budget_bytes: int = 20_000
+    #: Preset id (``providers.PROVIDERS``); stored settings without it are ``anthropic``.
+    provider: str = "anthropic"
+    #: ``full|compact|minimal``; ``None`` means the preset's default.
+    tool_set: Optional[str] = None
+    #: USD per 1M tokens; ``None`` means the preset's default price.
+    price_input_per_mtok: Optional[float] = None
+    price_output_per_mtok: Optional[float] = None
 
     def validated(self) -> "AgentSettings":
         """This settings object, or ``ValueError`` naming the first bad field."""
-        if self.model not in MODEL_CHOICES:
-            raise ValueError(f"model must be one of {', '.join(MODEL_CHOICES)}")
+        self._validate_provider_and_model()
+        if self.tool_set is not None and self.tool_set not in TOOL_SET_CHOICES:
+            raise ValueError(f"tool_set must be one of {', '.join(TOOL_SET_CHOICES)}")
+        for name in ("price_input_per_mtok", "price_output_per_mtok"):
+            value = getattr(self, name)
+            if value is not None and not is_valid_price(value):
+                raise ValueError(f"{name} must be a number between 0 and 1000")
         if self.effort not in EFFORT_CHOICES:
             raise ValueError(f"effort must be one of {', '.join(EFFORT_CHOICES)}")
         for name, (low, high) in LIMITS.items():
@@ -54,12 +78,48 @@ class AgentSettings:
                 raise ValueError(f"{name} must be between {low} and {high}")
         return self
 
+    def _validate_provider_and_model(self) -> None:
+        get_preset(self.provider)
+        if self.provider == "anthropic":
+            if self.model not in MODEL_CHOICES:
+                raise ValueError(f"model must be one of {', '.join(MODEL_CHOICES)}")
+        elif not self.model:
+            raise ValueError(f"set a model name for {self.provider}")
+        elif not isinstance(self.model, str) or not COMPAT_MODEL_PATTERN.fullmatch(self.model):
+            raise ValueError("model must be 1-128 characters of letters, digits and ._:/@-")
+
     def merged(self, changes: Mapping[str, Any]) -> "AgentSettings":
-        """A validated copy with ``changes`` applied; unknown keys are refused."""
+        """A validated copy with ``changes`` applied; unknown keys are refused.
+
+        Switching ``provider`` resets the model to the new preset's default and the tool
+        set and prices to ``None`` -- each only when it is not itself in ``changes`` -- so
+        ``{"provider": "ollama"}`` never sends a Claude model (or Claude prices) to Ollama.
+        """
         unknown = set(changes) - set(asdict(self))
         if unknown:
             raise ValueError(f"unknown setting(s): {', '.join(sorted(unknown))}")
-        return replace(self, **dict(changes)).validated()
+        return replace(self, **self._with_provider_defaults(changes)).validated()
+
+    def _with_provider_defaults(self, changes: Mapping[str, Any]) -> Dict[str, Any]:
+        updates = dict(changes)
+        provider = updates.get("provider", self.provider)
+        if provider == self.provider:
+            return updates
+        updates.setdefault("model", get_preset(provider).default_model)
+        for name in _PROVIDER_SCOPED:
+            updates.setdefault(name, None)
+        return updates
+
+    def effective_tool_set(self) -> str:
+        """The tool set in force: the analyst's choice, else the preset's default."""
+        return self.tool_set or get_preset(self.provider).default_tool_set
+
+    def effective_prices(self) -> Tuple[float, float]:
+        """``(input, output)`` USD per 1M tokens: overrides, else the preset's defaults."""
+        default_in, default_out = get_preset(self.provider).default_prices
+        return (default_in if self.price_input_per_mtok is None else self.price_input_per_mtok,
+                default_out if self.price_output_per_mtok is None
+                else self.price_output_per_mtok)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -76,7 +136,9 @@ EVENT_TYPES = (
     "tool_result",       # {id, ok, summary, bytes, truncated, locations? (≤10, omitted if none)}
     "approval_request",  # {id, tool, input, access, scopes: ["once", "chat"]}
     "approval_resolved",  # {id, allowed, message}
-    "usage",             # {turns, max_turns, cost_estimate_usd, max_budget_usd}
+    # {turns, max_turns, cost_estimate_usd, max_budget_usd, cost_known?}; cost_known is
+    # False when the estimate is meaningless (local provider or unknown prices).
+    "usage",
     "result",            # {session_id, num_turns, cost_estimate_usd, stop_reason, is_error}
     "error",             # {code, message}
 )
@@ -163,6 +225,9 @@ class ChatSpec:
     #: Bare tool name -> "read"|"write"|"never" (``mcp_server.tool_policy``); labels
     #: tool_call events. Tools missing from it are labelled "write" (fail closed).
     tool_access: Mapping[str, str] = field(default_factory=dict)
+    #: Per-chat scope note (case dir, dumps) prepended to the FIRST user message only
+    #: (the system prompt stays byte-stable); ``""``: none.
+    scope_note: str = ""
 
 
 class AgentBackend(Protocol):

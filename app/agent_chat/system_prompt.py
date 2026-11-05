@@ -6,7 +6,8 @@ per-chat belongs in the first user message (:func:`render_first_message`).
 
 from __future__ import annotations
 
-from typing import Mapping, Optional
+import json
+from typing import Mapping, Optional, Sequence
 
 _RULES = """\
 You assist an analyst doing AUTHORIZED memory forensics inside MemDiver.
@@ -38,6 +39,28 @@ def build_system_prompt(*, playbook_index: Mapping[str, str], start_text: str) -
     """The full system prompt; identical inputs give identical bytes."""
     index = "\n".join(f"- {name} - {playbook_index[name]}" for name in sorted(playbook_index))
     return f"{_RULES}\n\nPlaybooks\n{index}\n\n{start_text.strip()}\n"
+
+
+def render_scope(case_dir: Optional[str], dump_paths: Sequence[str]) -> str:
+    """The chat's scope (case dir, dumps) as a note for the first user message.
+
+    Without it the model has no way to learn the paths the tools need (a local model
+    then invents placeholders such as ``/path/to/case``). ``""`` when there is no scope.
+    Each path is a JSON string, so a newline or quote in a file name cannot break out
+    of its line.
+    """
+    lines = []
+    if case_dir:
+        lines.append(f"- case_dir: {json.dumps(case_dir)}")
+    lines.extend(f"- dump_path: {json.dumps(path)}" for path in dump_paths)
+    if not lines:
+        return ""
+    return "Chat scope (use these exact paths in tool arguments):\n" + "\n".join(lines)
+
+
+def with_scope(user_text: str, scope_note: str) -> str:
+    """``user_text`` preceded by ``scope_note`` (unchanged when there is none)."""
+    return f"{scope_note}\n\n---\n\n{user_text}" if scope_note else user_text
 
 
 def render_first_message(user_text: str, playbook_text: Optional[str] = None) -> str:

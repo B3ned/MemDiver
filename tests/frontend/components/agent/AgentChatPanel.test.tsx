@@ -11,12 +11,14 @@ vi.mock("@/api/agent", async (importOriginal) => {
     listPlaybooks: vi.fn(async () => []),
     startAgentChat: vi.fn(async () => ({ chat_id: "c1", ws_path: "/ws/agent/c1", read_tools: 3, write_tools: 1 })),
     deleteAgentChat: vi.fn(async () => {}),
+    putAgentSettings: vi.fn(),
   };
 });
 
-import { getAgentStatus } from "@/api/agent";
+import { getAgentSettings, getAgentStatus, putAgentSettings, type AgentStatus } from "@/api/agent";
 import { AgentChatPanel } from "@/components/agent/AgentChatPanel";
 import { useAgentStore } from "@/stores/agent-store";
+import { bundle, PROVIDERS } from "./fixtures";
 
 class FakeSocket {
   static last: FakeSocket;
@@ -92,5 +94,44 @@ describe("AgentChatPanel conversation", () => {
     expect(screen.getByTestId("usage-meter")).toHaveTextContent("Turns 1/8");
     fireEvent.click(screen.getByText("Interrupt"));
     expect(JSON.parse(FakeSocket.last.sent[2])).toEqual({ type: "interrupt" });
+  });
+});
+
+describe("AgentChatPanel status follows saved settings", () => {
+  const anthropicNoKey: AgentStatus = { available: true, backend: "sdk", credentials: false, provider: "anthropic", providers: PROVIDERS };
+
+  beforeEach(() => {
+    vi.mocked(getAgentStatus).mockReset();
+    vi.mocked(getAgentSettings).mockResolvedValue(bundle);
+  });
+
+  it("refetches the status after Save so the banner reflects the new provider", async () => {
+    vi.mocked(getAgentStatus)
+      .mockResolvedValueOnce(anthropicNoKey)
+      .mockResolvedValueOnce({ ...anthropicNoKey, credentials: true, provider: "ollama" });
+    vi.mocked(putAgentSettings).mockResolvedValue({ ...bundle, settings: { ...bundle.settings, provider: "ollama" } });
+    render(<AgentChatPanel />);
+    expect(await screen.findByText(/ANTHROPIC_API_KEY/)).toBeInTheDocument();
+
+    fireEvent.click(await screen.findByText("Save settings"));
+    await waitFor(() => expect(screen.queryByText(/ANTHROPIC_API_KEY/)).toBeNull());
+    expect(getAgentStatus).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Start chat")).not.toBeDisabled();
+  });
+
+  it("refetches the status after Reset and disables Start for an unavailable provider", async () => {
+    vi.mocked(getAgentStatus)
+      .mockResolvedValueOnce({ ...anthropicNoKey, credentials: true })
+      .mockResolvedValueOnce({ ...anthropicNoKey, available: false, provider: "openai", reason: "set OPENAI_API_KEY" });
+    vi.mocked(putAgentSettings).mockResolvedValue(bundle);
+    render(<AgentChatPanel />);
+    const start = await screen.findByText("Start chat");
+    await waitFor(() => expect(start).not.toBeDisabled());
+
+    fireEvent.click(await screen.findByText("Reset to defaults"));
+    expect(await screen.findByText("set OPENAI_API_KEY")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-provider")).toHaveTextContent("openai");
+    expect(screen.getByText("Start chat")).toBeDisabled();
+    expect(getAgentStatus).toHaveBeenCalledTimes(2);
   });
 });

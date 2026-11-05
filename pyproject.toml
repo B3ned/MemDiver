@@ -177,9 +177,10 @@ image = ["pakunoda", "volatility3>=2.27,<3"]
 # Disassembly helper (app/tools_disasm.py): capstone, lazy-imported behind an
 # install hint, exactly like vol3.
 disasm = ["capstone>=5"]
-# In-UI agent chat panel (app/agent_chat): Claude Agent SDK, lazy-imported behind
-# an install hint, exactly like vol3. docs/dev/agent_chat_panel_design.md.
-agent = ["claude-agent-sdk>=0.2.170"]
+# In-UI agent chat panel (app/agent_chat): Claude Agent SDK plus the openai SDK for
+# OpenAI-compatible providers, both lazy-imported behind an install hint, exactly
+# like vol3. docs/dev/agent_chat_panel_design.md.
+agent = ["claude-agent-sdk>=0.2.170", "openai>=2.15,<4"]
 # Every optional interface at once. Base already covers api + mcp + pcap, so
 # this adds the Marimo notebook UI and Volatility3.
 #
@@ -509,6 +510,14 @@ files = [
     "app/agent_chat/sdk_backend.py",
     "app/agent_chat/scripted_transport.py",
     "app/agent_chat/locations.py",
+    "app/agent_chat/mcp_tools.py",
+    "app/agent_chat/tool_events.py",
+    "app/agent_chat/backends.py",
+    "app/agent_chat/providers.py",
+    "app/agent_chat/tool_schemas.py",
+    "app/agent_chat/chat_model.py",
+    "app/agent_chat/compat_backend.py",
+    "app/agent_chat/scripted_model.py",
     # Wave 12 -- the parent-death watchdog. Stdlib-only and typed from the
     # start, so it joins the island on arrival. Its whole job is to run in a
     # child that is about to be orphaned, where a TypeError would simply leave

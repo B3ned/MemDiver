@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { agentSocketUrl, putAgentSettings, renderPlaybook, startAgentChat } from "@/api/agent";
+import { agentSocketUrl, listProviderModels, putAgentSettings, renderPlaybook, startAgentChat } from "@/api/agent";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -27,6 +27,13 @@ describe("agent client", () => {
     await startAgentChat({ case_dir: "/c" });
     expect(call(fn)[0]).toBe("/api/agent/chats");
     expect(JSON.parse(call(fn)[1].body as string)).toEqual({ case_dir: "/c" });
+  });
+
+  it("POSTs a provider's model listing", async () => {
+    const fn = mockFetch({ models: ["a"] });
+    expect(await listProviderModels("my llm")).toEqual({ models: ["a"] });
+    expect(call(fn)[0]).toBe("/api/agent/providers/my%20llm/models");
+    expect(call(fn)[1].method).toBe("POST");
   });
 
   it("builds a ws url from the ticket path", () => {

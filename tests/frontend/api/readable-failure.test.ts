@@ -57,6 +57,11 @@ describe("readableFailure", () => {
     expect(readableFailure(new ApiError(400, '{"code":17}'))).toBe('{"code":17}');
   });
 
+  it("unwraps a `{code, message}` object under `detail`", () => {
+    const body = '{"detail":{"code":"provider_error","message":"the provider refused the API key"}}';
+    expect(readableFailure(new ApiError(502, body))).toBe("the provider refused the API key");
+  });
+
   it("stringifies a non-Error rejection", () => {
     expect(readableFailure("plain string")).toBe("plain string");
     expect(readableFailure(42)).toBe("42");

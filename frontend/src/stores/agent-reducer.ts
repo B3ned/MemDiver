@@ -16,7 +16,11 @@ export type TranscriptItem =
     }
   | { kind: "error"; code: string; message: string };
 
-export interface Usage { turns: number; max_turns: number; cost_estimate_usd: number; max_budget_usd: number }
+export interface Usage {
+  turns: number; max_turns: number; cost_estimate_usd: number; max_budget_usd: number;
+  /** `false` when the provider has no price (e.g. a local model); absent means known. */
+  cost_known?: boolean;
+}
 export type ChatState = "idle" | "starting" | "ready" | "running" | "closed";
 
 export interface ChatView {
@@ -105,6 +109,7 @@ export function reduceChatEvent(view: ChatView, raw: unknown): ChatView {
       return { ...view, usage: {
         turns: num(ev.turns), max_turns: num(ev.max_turns), cost_estimate_usd: num(ev.cost_estimate_usd),
         max_budget_usd: num(ev.max_budget_usd),
+        ...(typeof ev.cost_known === "boolean" ? { cost_known: ev.cost_known } : {}),
       } };
     case "result":
       return { ...view, items: finishStreaming(items),

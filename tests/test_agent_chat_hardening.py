@@ -151,6 +151,22 @@ def test_child_env_blanks_credentials_even_when_inherited(env, monkeypatch):
         assert child[name] == "", name  # present and EMPTY: it overrides the inherited value
 
 
+PROVIDER_KEY_NAMES = ("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "VLLM_API_KEY",
+                      "MEMDIVER_AGENT_OPENAI_API_KEY")
+
+
+def test_child_env_has_no_provider_keys(env, monkeypatch):
+    """Dropped from the base env (the compat stdio client layers it over a whitelist) AND
+    blanked (the Claude CLI layers it over the full server env)."""
+    for name in PROVIDER_KEY_NAMES:
+        monkeypatch.setenv(name, f"sk-secret-{name}")
+    spec = chats.build_spec(None, [], {})
+    for name in PROVIDER_KEY_NAMES:
+        assert name in chats.CHILD_ENV_BLANKED and name in chats._CHILD_ENV_DROPPED
+        assert not spec.mcp.env.get(name), name
+    assert "sk-secret-" not in json.dumps(spec.mcp.env)
+
+
 def test_options_pass_blanked_child_env_and_output_cap(env, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret-value")
     monkeypatch.setenv("MEMDIVER_API_TOKEN", "tok")

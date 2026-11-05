@@ -12,18 +12,19 @@ credentials come from the server environment only (this module never injects any
 
 from __future__ import annotations
 
-import json
 import os
 import signal
 import warnings
 from typing import Any, Dict, List, Mapping, Optional
 
 from memdiver.app.agent_chat import contracts as c
-from memdiver.app.agent_chat.locations import extract_locations
+from memdiver.app.agent_chat.tool_events import (
+    SUMMARY_CHARS, access_label, is_error_payload, result_text, tool_result_event)
 from memdiver.core.install_hints import missing_package_message
 from memdiver.core.service_errors import CapabilityError, ErrorCategory
 
-SUMMARY_CHARS = 300
+__all__ = ["SUMMARY_CHARS", "SdkAgentBackend", "build_options", "make_backend"]
+
 #: Built-in Claude Code tools refused on top of ``tools=[]`` (belt and braces).
 _BUILTIN_TOOLS_DENIED = [
     "Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "NotebookEdit",
@@ -83,27 +84,9 @@ def _strip_prefix(name: str) -> str:
     return name[len(c.TOOL_PREFIX):] if name.startswith(c.TOOL_PREFIX) else name
 
 
-def _result_text(content: Any) -> str:
-    """Flatten a ``tool_result`` content (str, or list of text blocks) to text."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    parts = []
-    for block in content if isinstance(content, list) else [content]:
-        parts.append(block.get("text", "") if isinstance(block, dict) else str(block))
-    return "".join(parts)
-
-
-def _is_error_payload(text: str) -> bool:
-    """MemDiver tools report failures as ``{"error": ...}`` JSON, not as MCP errors."""
-    if not text.startswith("{"):
-        return False
-    try:
-        body = json.loads(text)
-    except ValueError:
-        return False
-    return isinstance(body, dict) and "error" in body
+#: Backward-compatible private names (now public in :mod:`tool_events`).
+_result_text = result_text
+_is_error_payload = is_error_payload
 
 
 def build_options(spec: c.ChatSpec, gate: c.PermissionGate,
@@ -279,17 +262,8 @@ class SdkAgentBackend:
         for block in message.content:
             if not isinstance(block, self._sdk.ToolResultBlock):
                 continue
-            text = _result_text(block.content)
-            data: Dict[str, Any] = {
-                "id": block.tool_use_id,
-                "ok": not block.is_error and not _is_error_payload(text),
-                "summary": text[:SUMMARY_CHARS],
-                "bytes": len(text.encode("utf-8")),
-                "truncated": "_result_budget" in text}
-            locations = extract_locations(text)
-            if locations:
-                data["locations"] = locations
-            await self._emit(c.ChatEvent("tool_result", data))
+            await self._emit(tool_result_event(
+                block.tool_use_id, result_text(block.content), bool(block.is_error)))
 
     async def _result(self, message: Any) -> None:
         cost = float(message.total_cost_usd or 0.0)
@@ -302,8 +276,7 @@ class SdkAgentBackend:
             "is_error": bool(message.is_error)}))
 
     def _access_of(self, name: str) -> str:
-        access = self._tool_access.get(name, "write")
-        return access if access in ("read", "write") else "write"
+        return access_label(self._tool_access, name)
 
     # -- errors --------------------------------------------------------------------
 
@@ -326,20 +299,9 @@ class SdkAgentBackend:
 
 
 def make_backend(kind: str = "sdk", tool_access: Optional[Mapping[str, str]] = None) -> Any:
-    """``"sdk"`` (real model) or ``"scripted"`` (no model; needs ``MEMDIVER_AGENT_SCRIPT``)."""
-    if kind == "sdk":
-        return SdkAgentBackend(tool_access=tool_access)
-    if kind == "scripted":
-        path = os.environ.get("MEMDIVER_AGENT_SCRIPT", "")
-        if not path:
-            raise CapabilityError(
-                "the scripted agent backend needs MEMDIVER_AGENT_SCRIPT=<script.json>",
-                category=ErrorCategory.PRECONDITION, code="agent.script_missing")
-        from memdiver.app.agent_chat.scripted_transport import (
-            ScriptedCliTransport, load_script)
+    """``"sdk"`` (real model) or ``"scripted"`` (no model; needs ``MEMDIVER_AGENT_SCRIPT``).
 
-        script = load_script(path)
-        return SdkAgentBackend(
-            transport_factory=lambda: ScriptedCliTransport(script), tool_access=tool_access)
-    raise CapabilityError(f"unknown agent backend '{kind}' (sdk|scripted)",
-                          code="agent.backend_unknown")
+    Thin delegate kept for existing callers; the factory lives in :mod:`backends`."""
+    from memdiver.app.agent_chat.backends import make_backend as _make_backend
+
+    return _make_backend(kind, tool_access)

@@ -25,10 +25,13 @@ from memdiver.api.services import agent_playbooks
 from memdiver.api.user_prefs import read_pref
 from memdiver.app.agent_chat import contracts as c
 from memdiver.app.agent_chat.gate import ApprovalGate
-from memdiver.app.agent_chat.sdk_backend import make_backend
+from memdiver.app.agent_chat.backends import make_backend
+from memdiver.app.agent_chat.providers import (
+    CUSTOM_API_KEY_ENV, KIND_CLAUDE_SDK, PROVIDERS, ProviderPreset, get_preset,
+    provider_availability, provider_public_info)
 from memdiver.app.agent_chat.session import ChatRegistry, ChatSession
 from memdiver.app.agent_chat.settings_store import load_settings
-from memdiver.app.agent_chat.system_prompt import build_system_prompt
+from memdiver.app.agent_chat.system_prompt import build_system_prompt, render_scope
 from memdiver.core.constants import memdiver_home
 from memdiver.core import path_sandbox
 from memdiver.core.install_hints import missing_package_message
@@ -37,18 +40,28 @@ from memdiver.core.service_errors import CapabilityError, ErrorCategory
 BACKEND_ENV = "MEMDIVER_AGENT_BACKEND"
 SCRIPT_ENV = "MEMDIVER_AGENT_SCRIPT"
 SDK_MODULE = "claude_agent_sdk"
-#: Server-env variables that count as agent credentials (their VALUES never leave the server).
+COMPAT_MODULE = "openai"
+BACKEND_CHOICES = ("sdk", "scripted", "scripted-compat")
+#: Server-env variables that count as Claude (anthropic) credentials (their VALUES never
+#: leave the server).
 CREDENTIAL_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+#: API keys of the OpenAI-compatible presets (derived from the preset table) plus the
+#: ``custom`` preset's key; also server-side only.
+PROVIDER_KEY_VARS = tuple(dict.fromkeys(
+    [p.key_env for p in PROVIDERS.values() if p.key_env] + [CUSTOM_API_KEY_ENV]))
 CLOUD_PROVIDER_FLAGS = ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
                         "CLAUDE_CODE_USE_FOUNDRY")
-#: Secrets the MCP child has no use for; everything else (PATH, ...) is inherited.
-_CHILD_ENV_DROPPED = (*CREDENTIAL_VARS, "MEMDIVER_API_TOKEN")
+#: Secrets the MCP child has no use for; everything else (PATH, ...) is inherited. The
+#: compat backend's stdio client builds the child env from this mapping (over a small
+#: default whitelist), so dropping is what keeps provider keys out of that child.
+_CHILD_ENV_DROPPED = (*CREDENTIAL_VARS, *PROVIDER_KEY_VARS, "MEMDIVER_API_TOKEN")
 #: Credentials the MCP child must never see; set to "" (not removed) in its env because the
 #: CLI merges that env over the inherited one.
 CHILD_ENV_BLANKED = (
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
     "MEMDIVER_API_TOKEN", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "GOOGLE_APPLICATION_CREDENTIALS")
+    "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "GOOGLE_APPLICATION_CREDENTIALS",
+    *PROVIDER_KEY_VARS)
 MAX_OPEN_CHATS = 4
 #: A chat that no WebSocket attaches to within this long is closed (frees its slot).
 UNATTACHED_TTL_SECONDS = 120.0
@@ -64,27 +77,90 @@ def _env_flag(name: str) -> bool:
 
 
 def has_credentials() -> bool:
-    """True when the SERVER env carries something the agent runtime can authenticate with."""
+    """True when the SERVER env carries something the Claude runtime can authenticate with."""
     return any(os.environ.get(v) for v in CREDENTIAL_VARS) or any(
         _env_flag(v) for v in CLOUD_PROVIDER_FLAGS)
 
 
+def _provider_credentials(preset: ProviderPreset) -> bool:
+    """Whether ``preset`` has what it needs to authenticate (a key, or none required)."""
+    if preset.kind == KIND_CLAUDE_SDK:
+        return has_credentials()
+    return bool((os.environ.get(preset.key_env) or "").strip()) if preset.key_env \
+        else not preset.key_required
+
+
+def _selected_settings() -> c.AgentSettings:
+    settings, _ = load_settings(read_pref)
+    return settings
+
+
+def prices_missing_reason(settings: c.AgentSettings) -> Optional[str]:
+    """Why ``settings`` cannot enforce ``max_budget_usd``: a non-local OpenAI-compatible
+    provider whose effective prices are both 0 (e.g. ``custom`` left at its defaults).
+    ``None`` when the budget can be enforced (or there is nothing to pay)."""
+    preset = get_preset(settings.provider)
+    if preset.kind == KIND_CLAUDE_SDK or preset.local:
+        return None
+    if any(price > 0 for price in settings.effective_prices()):
+        return None
+    return (f"set input/output prices for the '{preset.id}' provider in the chat settings "
+            "so the cost budget can be enforced")
+
+
+def _missing_package(status: Dict[str, Any], module: str, package: str, what: str) -> bool:
+    """Record a missing ``module`` on ``status``; True when it is missing."""
+    if importlib.util.find_spec(module) is not None:
+        return False
+    status["reason"] = f"{what} is not installed"
+    status["install_hint"] = missing_package_message(package, "agent")
+    return True
+
+
+def _check_sdk_backend(status: Dict[str, Any], settings: c.AgentSettings) -> None:
+    preset = get_preset(settings.provider)
+    if preset.kind == KIND_CLAUDE_SDK:
+        if not _missing_package(status, SDK_MODULE, "claude-agent-sdk",
+                                "the Claude Agent SDK"):
+            status["available"] = True
+        return
+    if _missing_package(status, COMPAT_MODULE, "openai", "the openai package"):
+        return
+    available, reason = provider_availability(preset, os.environ)
+    if available:
+        reason = prices_missing_reason(settings)
+        available = reason is None
+    status["available"] = available
+    if reason:
+        status["reason"] = reason
+
+
 def agent_status() -> Dict[str, Any]:
-    """``{available, backend, credentials, reason?, install_hint?}`` (never any secret value)."""
+    """``{available, backend, credentials, provider, providers, reason?, install_hint?}``.
+
+    ``credentials`` and the availability concern the SELECTED provider (``sdk`` backend);
+    the scripted backends need no model and no key. Never carries any secret value.
+    """
     backend = os.environ.get(BACKEND_ENV, "").strip().lower() or "sdk"
-    status: Dict[str, Any] = {"available": False, "backend": backend,
-                              "credentials": has_credentials()}
-    if backend not in ("sdk", "scripted"):
+    settings = _selected_settings()
+    preset = get_preset(settings.provider)
+    status: Dict[str, Any] = {
+        "available": False, "backend": backend, "credentials": _provider_credentials(preset),
+        "provider": preset.id,
+        "providers": [provider_public_info(p, os.environ) for p in PROVIDERS.values()]}
+    if backend not in BACKEND_CHOICES:
         status["backend"] = "sdk"
-        status["reason"] = f"unknown {BACKEND_ENV} '{backend}' (sdk|scripted)"
-    elif backend == "scripted" and not os.environ.get(SCRIPT_ENV):
-        status["reason"] = f"the scripted backend needs {SCRIPT_ENV}=<script.json>"
-    elif importlib.util.find_spec(SDK_MODULE) is None:
-        hint = missing_package_message("claude-agent-sdk", "agent")
-        status["reason"] = "the Claude Agent SDK is not installed"
-        status["install_hint"] = hint
+        status["reason"] = f"unknown {BACKEND_ENV} '{backend}' ({'|'.join(BACKEND_CHOICES)})"
+    elif backend.startswith("scripted") and not os.environ.get(SCRIPT_ENV):
+        status["reason"] = f"the {backend} backend needs {SCRIPT_ENV}=<script.json>"
+    elif backend == "scripted-compat":
+        status["available"] = True  # the scripted model: neither SDK nor openai needed
+    elif backend == "scripted":
+        if not _missing_package(status, SDK_MODULE, "claude-agent-sdk",
+                                "the Claude Agent SDK"):
+            status["available"] = True
     else:
-        status["available"] = True
+        _check_sdk_backend(status, settings)
     return status
 
 
@@ -190,11 +266,16 @@ def _child_env(roots: List[str]) -> Dict[str, str]:
 
 
 def build_spec(case_dir: Optional[str], dump_paths: List[str],
-               access: Dict[str, str]) -> c.ChatSpec:
-    """The :class:`ChatSpec` of one chat; ``ValueError`` for a missing path."""
+               access: Dict[str, str],
+               settings: Optional[c.AgentSettings] = None) -> c.ChatSpec:
+    """The :class:`ChatSpec` of one chat; ``ValueError`` for a missing path.
+
+    ``settings`` defaults to the stored per-user settings.
+    """
     case = _validated_case_dir(case_dir) if case_dir else None
     dumps = [_validated_dump(p) for p in dump_paths]
-    settings, _ = load_settings(read_pref)
+    if settings is None:
+        settings, _ = load_settings(read_pref)
     env = _child_env(_child_roots(case, dumps))
     env["MEMDIVER_MCP_RESULT_BUDGET"] = str(settings.result_budget_bytes)
     config_dir = memdiver_home() / "agent" / "claude"
@@ -210,7 +291,8 @@ def build_spec(case_dir: Optional[str], dump_paths: List[str],
         allowed_tools=allowed_tool_names(),
         cwd=str(case or memdiver_home()),
         config_dir=str(config_dir),
-        tool_access=access)
+        tool_access=access,
+        scope_note=render_scope(str(case) if case else None, [str(d) for d in dumps]))
 
 
 # -- registry of open chats ---------------------------------------------------------------
@@ -260,15 +342,13 @@ async def create_chat(case_dir: Optional[str], dump_paths: List[str]) -> Dict[st
     ``CapabilityError`` (503) when the agent runtime is unavailable, ``ValueError`` for a
     bad path, ``RuntimeError`` when too many chats are open.
     """
+    settings = _selected_settings()
     status = agent_status()
     if not status["available"]:
-        raise CapabilityError(
-            str(status.get("reason") or "agent unavailable"),
-            category=ErrorCategory.PRECONDITION, status=503, code="agent.unavailable",
-            details={"install_hint": status.get("install_hint")})
+        raise _unavailable_error(status, settings)
     access = tool_access_map()
-    spec = build_spec(case_dir, dump_paths, access)
-    backend = make_backend(str(status["backend"]), access)
+    spec = build_spec(case_dir, dump_paths, access, settings)
+    backend = make_backend(str(status["backend"]), access, settings=settings)
     chat_id = uuid.uuid4().hex
     queue: "asyncio.Queue[c.ChatEvent]" = asyncio.Queue()
 
@@ -284,6 +364,18 @@ async def create_chat(case_dir: Optional[str], dump_paths: List[str]) -> Dict[st
     return {"chat_id": chat_id, "ws_path": f"/ws/agent/{chat_id}",
             "read_tools": read, "write_tools": write,
             "warnings": write_warnings(Path(spec.cwd) if case_dir else None)}
+
+
+def _unavailable_error(status: Dict[str, Any], settings: c.AgentSettings) -> CapabilityError:
+    """``agent.prices_required`` (409) when only the missing prices block the chat, else
+    ``agent.unavailable`` (503)."""
+    reason = str(status.get("reason") or "agent unavailable")
+    if status["backend"] == "sdk" and reason == prices_missing_reason(settings):
+        return CapabilityError(reason, category=ErrorCategory.PRECONDITION, status=409,
+                               code="agent.prices_required")
+    return CapabilityError(reason, category=ErrorCategory.PRECONDITION, status=503,
+                           code="agent.unavailable",
+                           details={"install_hint": status.get("install_hint")})
 
 
 async def close_chat(chat_id: str) -> bool:
