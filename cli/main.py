@@ -232,15 +232,25 @@ def _build_parser() -> argparse.ArgumentParser:
     # incremental consensus (Welford-backed, persisted state)
     cb = sub.add_parser(
         "consensus-begin",
-        help="Create a new incremental consensus session on disk",
+        help="Create a new consensus session on disk (generic Welford, or "
+             "Android Scudo collect)",
     )
     cb.add_argument("--state", required=True, help="Path to session state JSON")
-    cb.add_argument("--size", type=int, required=True,
-                    help="Consensus width in bytes")
+    cb.add_argument("--size", type=int, default=None,
+                    help="Consensus width in bytes (generic/Welford pipeline). "
+                         "Omit and pass --allocator scudo/auto for the Android "
+                         "Scudo pipeline; mutually exclusive with "
+                         "--allocator scudo.")
     cb.add_argument("dumps", nargs="*",
                     help="Optional dumps the session will be fed: their "
                          "experiment cohort is recorded and enforced by "
                          "consensus-add")
+    add_allocator_argument(
+        cb, default=None,
+        help_text="Select the Android Scudo pipeline instead of --size: "
+                  "'scudo' forces it; 'auto' defers to memdiver's allocator "
+                  "detection on the reference dump at search-reduce time and "
+                  "requires Scudo. Mutually exclusive with --size.")
     add_mixed_ok_argument(cb)
     cb.add_argument("-v", "--verbose", action="store_true")
     ca = sub.add_parser(
@@ -436,12 +446,20 @@ def _build_parser() -> argparse.ArgumentParser:
     # search-reduce
     sr = sub.add_parser(
         "search-reduce",
-        help="Reduce candidate set: variance → alignment → entropy",
+        help="Reduce candidate set: variance → alignment → entropy "
+             "(generic/Welford), or an Android Scudo heap session",
         parents=[_decrypt_parent_parser()],
     )
-    sr.add_argument("--state", required=True, help="Path to consensus state JSON")
+    sr.add_argument("--state", required=True,
+                    help="Path to a consensus state JSON: a generic (Welford) "
+                         "session, or an Android Scudo collect session "
+                         "(consensus-begin --allocator scudo/auto). The state's "
+                         "kind selects the pipeline.")
     sr.add_argument("--reference-dump", required=True,
-                    help="One dump file used for per-region entropy sampling")
+                    help="One dump file used for per-region entropy sampling "
+                         "(generic), or the dump brute-force will read and whose "
+                         "flat 'vas' offsets the regions are in (Scudo; must be "
+                         "one of the collected dumps)")
     sr.add_argument("--alignment", type=int, default=8)
     sr.add_argument("--block-size", type=int, default=32)
     sr.add_argument("--density-threshold", type=float, default=0.5)
@@ -464,11 +482,19 @@ def _build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--order", choices=("offset", "rank"), default="offset",
                     help="Order of the emitted regions (default offset). Every "
                          "region carries 'rank' and 'score' either way.")
+    sr.add_argument("--key-sizes", default="32",
+                    help="Scudo session only: comma-separated key sizes for the "
+                         "reported window estimate (never filters; default 32, "
+                         "brute-force's default; 48 for TLS_AES_256_GCM_SHA384). "
+                         "Ignored by the generic/Welford path.")
     sr.add_argument("-o", "--output", required=True, help="Output candidates.json")
     sr.add_argument("-v", "--verbose", action="store_true")
     # The Welford --state session carries no heap roles, so 'annotate' is a
-    # no-op here and 'mask' is refused (use analyze-candidates for heap work).
+    # no-op there and 'mask' is refused (use analyze-candidates for heap work).
     add_heap_policy_argument(sr)
+    # Scudo session only: lift the cohort.mixed refusal when the collected dumps
+    # span experiment cohorts on purpose. Ignored by the generic/Welford path.
+    add_mixed_ok_argument(sr)
     # analyze-candidates (the exploratory path: no oracle, no capture)
     ac = sub.add_parser(
         "analyze-candidates",

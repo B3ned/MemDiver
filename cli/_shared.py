@@ -68,12 +68,21 @@ PIPELINE_ALLOCATOR_CHOICES = ALLOCATOR_CHOICES + ("off",)
 HEAP_POLICY_CHOICES = ("off", "annotate", "mask")
 
 
-def add_allocator_argument(parser: argparse.ArgumentParser) -> None:
-    """Register ``--allocator`` (heap-role annotation of the consensus)."""
+def add_allocator_argument(parser: argparse.ArgumentParser, *,
+                           default: "str | None" = "auto",
+                           help_text: "str | None" = None) -> None:
+    """Register ``--allocator`` (heap-role annotation of the consensus).
+
+    ``default`` / ``help_text`` let a command whose ``--allocator`` selects a
+    different pipeline (consensus-begin, where it chooses the Scudo path and so
+    defaults to None = "omitted") override them; every other caller keeps the
+    auto-detect default and the generic help.
+    """
     parser.add_argument(
-        "--allocator", choices=PIPELINE_ALLOCATOR_CHOICES, default="auto",
-        help="Heap allocator for the non-destructive heap-role annotation "
-             "(default: auto-detect; 'off' disables heap analysis)")
+        "--allocator", choices=PIPELINE_ALLOCATOR_CHOICES, default=default,
+        help=help_text or (
+            "Heap allocator for the non-destructive heap-role annotation "
+            "(default: auto-detect; 'off' disables heap analysis)"))
 
 
 def add_mixed_ok_argument(parser: argparse.ArgumentParser) -> None:
