@@ -241,8 +241,38 @@ memdiver locate-key dumps/ --key-hex '<hex>' --allocator ptmalloc2 -o loc.json
 The JSON payload carries the heap data as it is. On stderr, `consensus`
 prints a `heap status=...` line, and `analyze-candidates` and `locate-key`
 print one line per chunk-resident candidate or hit, with hits in freed chunks
-marked `residual`. `search-reduce` reads a Welford `--state` session that has
-no heap roles, so `annotate` does nothing there and `mask` is refused.
+marked `residual`. `search-reduce`'s generic (Welford) mode reads a `--state`
+session that has no heap roles, so `annotate` does nothing there and `mask` is
+refused.
+
+## Android Scudo heaps across cold boots
+
+Across Android cold boots a positional consensus does not line up — Scudo
+re-places every heap chunk each run — so `search-reduce` takes a second kind of
+`--state` session. Begin it with `consensus-begin --allocator scudo` (or
+`auto`) instead of `--size`, record each cold-boot run with `consensus-add`
+(the reference among them), then run `search-reduce --state …` as usual: it
+pairs heap chunks by allocator signature and content across the runs, keeping
+the reference's chunks that can hold a per-run value. `--allocator scudo`
+forces the Scudo path; `--allocator auto` defers to memdiver's own allocator
+detection on the reference at `search-reduce` time and requires Scudo (any
+other allocator is refused — use `--size` for the generic pipeline).
+`search-reduce`'s CLI surface is unchanged (`--state --reference-dump -o`); the
+session's kind selects the pipeline, and the output is the same
+`candidates.json` contract `brute-force` reads:
+
+```bash
+memdiver consensus-begin --state scudo.json --allocator scudo
+for run in rnd-*.msl; do memdiver consensus-add --state scudo.json "$run"; done
+memdiver search-reduce --state scudo.json --reference-dump rnd-1.msl \
+  --key-sizes 48 -o cand.json
+memdiver brute-force --candidates cand.json --dump rnd-1.msl --pcap "$PWD/rnd-1.pcap" \
+  --key-sizes 48 --stride 1 -o hits.json
+```
+
+`--key-sizes` only sizes the reported window estimate; it never filters a
+region. A short funnel — how the reference's chunks were judged, what is kept,
+what could not be judged — goes to stderr.
 
 ## Importing only some regions
 
