@@ -118,6 +118,80 @@ The contract every parser must honour:
 - **Raising is allowed but costly.** `analyze_heap` catches the exception,
   records `parser raised …` and falls back to the next candidate.
 
+### Segment-based parsers (recommended)
+
+The flat loop above is fine for a first parser. Allocators with more than one
+arena or more than one kind of mapping are easier to get right with the shared
+shape in `heap/segments.py`. A parser then works in three steps:
+
+1. **Discover** the allocator's arenas (`HeapArena`) and the contiguous
+   segments (`HeapSegment(va, end, walk_start, arena_id, kind, name)`) each
+   arena owns: the main heap, thread heaps, mmapped chunks, size-class
+   regions, groups.
+2. **Walk** each segment from its `walk_start`. A single `ChunkBudget` shared
+   by all segments enforces `ParseOptions.max_chunks` the same way for every
+   allocator (`budget.take(n)` returns `False` and sets `truncated` once the
+   budget runs out).
+3. **Assemble** with a `LayoutAssembler`. It records each segment as a
+   `HeapRegion`, stamps the segment's `arena_id` onto chunks that do not set
+   one themselves, accumulates the standard coverage keys and builds the
+   `HeapLayout`.
+
+```python
+from memdiver.heap import AllocatorKind
+from memdiver.heap.model import ARENA_MAIN, REGION_MAIN_HEAP, Evidence, HeapArena
+from memdiver.heap.segments import ChunkBudget, HeapSegment, LayoutAssembler
+
+def parse_foo(memory, ctx, options):
+    asm = LayoutAssembler(AllocatorKind.FOO, ctx.platform)
+    budget = ChunkBudget(options.max_chunks)
+    for arena, segments in discover_foo_arenas(memory, ctx, options):
+        asm.add_arena(arena)            # e.g. HeapArena(0, ARENA_MAIN, va=...)
+        for seg in segments:            # HeapSegment(..., kind=REGION_MAIN_HEAP)
+            chunks, walked, skipped = walk_foo_segment(memory, seg, budget)
+            asm.add_segment(seg, chunks, walked=walked, skipped=skipped)
+        for free_list in foo_free_lists(memory, arena):
+            asm.add_free_list(free_list)   # FreeList(..., arena_id=arena.arena_id)
+    if budget.truncated:
+        asm.mark_truncated(budget.max_chunks)   # adds the shared diagnostic once
+    asm.evidence(Evidence("foo_magic", "arena magic matched", 0.9))
+    return asm.build(version_hint=None)   # confidence defaults to walked / total
+```
+
+Use `asm.diagnose(message)` for anything you could not decode. `build()` takes
+`extra_coverage` (allocator-specific keys, merged last), `extra_evidence` and an
+explicit `confidence`.
+
+Conventions:
+
+- **Arena kinds.** `HeapArena.kind` is one of `ARENA_MAIN` (`"main"`),
+  `ARENA_THREAD` (`"thread"`) or `ARENA_MMAP` (`"mmap"`, a pseudo arena that
+  owns mmapped chunks). Allocator-specific strings are allowed when none fits.
+- **Region kinds.** Reuse `REGION_MAIN_HEAP` (`"heap"`), `REGION_THREAD_HEAP`
+  (`"thread_heap"`) and `REGION_MMAPPED_CHUNK` (`"mmapped_chunk"`) for the
+  common cases. Allocator-specific kinds (`"arena"`, `"group"`, scudo
+  size-class regions, ...) are allowed too.
+- **`HeapArena.top_va`** is the address of the arena's `top` *field* (the slot
+  inside the control structure; ptmalloc2: `&arena.top`), not the top chunk.
+  Put the top chunk's VA in `extra["top_chunk_va"]`. `va` is the control
+  structure (e.g. `malloc_state`) when known, and `region_vas` lists the
+  regions the arena owns.
+- **`arena_id`** links chunks, regions and free lists to their arena.
+  `HeapChunk.arena_id` and `HeapRegion.arena_id` are filled from the segment;
+  set `FreeList.arena_id` yourself, because bin `kind` / `index` repeat across
+  arenas.
+- **Standard coverage keys** (`HeapLayout.coverage`): `regions` (segment
+  names, or hex VAs for nameless segments), `arenas` (count), `bytes_total`,
+  `bytes_walked`, `bytes_skipped`, `bytes_uncaptured`, `chunk_count` and
+  `truncated`.
+
+The reference implementation is ptmalloc2: `heap/allocators/ptmalloc2.py`
+(probe and parse orchestration), `ptmalloc2_walk.py` (chunk walker),
+`ptmalloc2_bins.py` (tcache, fastbins and bins, `main_arena`),
+`ptmalloc2_arenas.py` (thread-arena discovery),
+`ptmalloc2_segments.py` (segments, fenceposts, `assemble_layout`) and
+`ptmalloc2_mmapped.py` (mmapped-chunk scan).
+
 ## 4. Register a descriptor
 
 ```python
@@ -206,3 +280,28 @@ Then run the surface parity tests (`tests/test_heap_surfaces.py`,
 `tests/test_tools_heap.py`) and, if you have real captures, the opt-in
 `MEMDIVER_REAL_HEAP_DUMPS` suite described in the
 [user guide](../user_guide/heap.md#real-dump-opt-in-tests).
+
+## 7. Opting into allocator-aware reduction
+
+`search-reduce` and `consensus-begin --allocator` only accept allocators whose
+descriptor sets `reduce_ready=True`, because a wrong heap role there can mask
+the key you are looking for. The flag defaults to `False`. Opt in only when:
+
+- [ ] the parser follows the segment-based shape above (arenas, segments,
+      `arena_id`, standard coverage keys);
+- [ ] synthetic tests cover every arena and segment kind it reports, including
+      negative controls (random bytes and look-alike regions are not
+      detected, and no chunks are invented);
+- [ ] the descriptor sets `reduce_ready=True`: in a `BuiltinSpec` row of
+      `heap/builtin.py` (`_spec(..., reduce_ready=True)`) for in-tree
+      allocators, or in `AllocatorDescriptor(..., reduce_ready=True)` for
+      plugins;
+- [ ] the name is added to `cli/_shared.SEARCH_REDUCE_ALLOCATOR_CHOICES`. Its
+      concrete names (everything except `auto` and `off`) must equal
+      `memdiver.heap.registry.reduce_ready_kinds()`, and
+      `test_search_reduce_allocator_choices_match_reduce_ready_kinds` in
+      `tests/test_cli_heap_policy.py` enforces it
+      (`tests/test_heap_registry.py` pins the built-in set).
+
+ptmalloc2 (`heap/allocators/ptmalloc2*.py`) is currently the only
+`reduce_ready` allocator and the reference to follow.

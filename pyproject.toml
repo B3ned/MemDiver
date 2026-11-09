@@ -534,7 +534,13 @@ files = [
     "heap/detect.py",
     "heap/builtin.py",
     "heap/analyze.py",
+    "heap/segments.py",
     "heap/allocators/ptmalloc2.py",
+    "heap/allocators/ptmalloc2_walk.py",
+    "heap/allocators/ptmalloc2_bins.py",
+    "heap/allocators/ptmalloc2_segments.py",
+    "heap/allocators/ptmalloc2_arenas.py",
+    "heap/allocators/ptmalloc2_mmapped.py",
     "heap/allocators/scudo.py",
     "heap/allocators/mallocng.py",
     "heap/allocators/jemalloc.py",
@@ -546,6 +552,7 @@ files = [
     "engine/candidate_heap.py",
     "engine/heap_hits.py",
     "app/_pipeline_heap.py",
+    "app/welford_heap.py",
     # Wave 14 -- the ISF and key-finder tool layers (1.0.7), back-filled once
     # their three remaining errors (Optional narrowing) were fixed.
     "app/tools_isf.py",

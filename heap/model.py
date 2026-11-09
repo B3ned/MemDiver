@@ -8,6 +8,8 @@ mode — never need to know which allocator a dump used:
 * :class:`HeapRegion` — a mapping the allocator owns;
 * :class:`FreeList` — one walked free list (tcache bin, fastbin, freelist);
 * :class:`Evidence` — why the detector believes in an allocator;
+* :class:`HeapArena` — one allocator arena (main / thread / mmap) that
+  regions and chunks point back to through their ``arena_id``;
 * :class:`HeapLayout` — the whole result, with VA lookups
   (:meth:`HeapLayout.chunk_at`) and a per-byte role projection
   (:meth:`HeapLayout.role_runs`).
@@ -101,6 +103,7 @@ class HeapChunk:
     extra: Mapping[str, Any] = field(default_factory=dict, hash=False)
     confidence: float = 1.0
     roles: Optional[Tuple[Tuple[int, int, HeapRole], ...]] = None
+    arena_id: Optional[int] = None
 
     @property
     def end(self) -> int:
@@ -143,7 +146,13 @@ class HeapChunk:
             "confidence": self.confidence,
             "roles": ([[off, length, int(role)] for off, length, role in self.roles]
                       if self.roles is not None else None),
+            **_arena_id_entry(self.arena_id),
         }
+
+
+def _arena_id_entry(arena_id: Optional[int]) -> Dict[str, int]:
+    """``{"arena_id": n}`` when set, else ``{}`` (keeps old payloads unchanged)."""
+    return {} if arena_id is None else {"arena_id": arena_id}
 
 
 def _topmost_role(layers: Sequence[_Segment], va: int) -> HeapRole:
@@ -154,6 +163,57 @@ def _topmost_role(layers: Sequence[_Segment], va: int) -> HeapRole:
     return HeapRole.NONE
 
 
+#: Arena kinds (:attr:`HeapArena.kind`).
+ARENA_MAIN = "main"
+ARENA_THREAD = "thread"
+ARENA_MMAP = "mmap"
+
+#: Per-chunk arena-kind codes (uint8, e.g. in ``heap_roles.npz``): index into
+#: this tuple. ``0`` = unknown (no arena tracked); ``"other"`` stands for any
+#: allocator-specific kind.
+ARENA_KIND_CODES: Tuple[str, ...] = (
+    "", ARENA_MAIN, ARENA_THREAD, ARENA_MMAP, "other")
+
+
+def arena_entry(kind: Optional[str]) -> Dict[str, str]:
+    """``{"arena": kind}`` when the arena *kind* is known, else ``{}``."""
+    return {"arena": kind} if isinstance(kind, str) and kind else {}
+
+#: Shared region kinds (:attr:`HeapRegion.kind`). Allocator-specific kinds
+#: (``"arena"``, ``"group"``, scudo size-class regions, ...) are allowed too;
+#: these are the names every parser should reuse for the common cases.
+REGION_MAIN_HEAP = "heap"
+REGION_THREAD_HEAP = "thread_heap"
+REGION_MMAPPED_CHUNK = "mmapped_chunk"
+
+
+@dataclass(frozen=True)
+class HeapArena:
+    """One allocator arena: the owner of a set of regions and chunks.
+
+    ``kind`` is one of :data:`ARENA_MAIN` / :data:`ARENA_THREAD` /
+    :data:`ARENA_MMAP` (or an allocator-specific name); ``va`` is the
+    arena's control structure (e.g. ``malloc_state``) when known;
+    ``top_va`` is the VA of the arena's ``top`` FIELD (ptmalloc2:
+    ``&arena.top``), not the top chunk itself, whose VA goes into
+    ``extra["top_chunk_va"]``; ``region_vas`` are the regions it owns.
+    """
+
+    arena_id: int
+    kind: str
+    va: Optional[int] = None
+    top_va: Optional[int] = None
+    region_vas: Tuple[int, ...] = ()
+    extra: Dict[str, Any] = field(default_factory=dict, hash=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "arena_id": self.arena_id, "kind": self.kind, "va": self.va,
+            "top_va": self.top_va, "region_vas": list(self.region_vas),
+            "extra": _json_safe(dict(self.extra)),
+        }
+
+
 @dataclass(frozen=True)
 class HeapRegion:
     """A mapping owned by the allocator (arena, scudo region, mallocng group)."""
@@ -162,11 +222,20 @@ class HeapRegion:
     size: int
     name: str
     kind: str
+    arena_id: Optional[int] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"va": self.va, "size": self.size, "name": self.name,
+                "kind": self.kind, **_arena_id_entry(self.arena_id)}
 
 
 @dataclass(frozen=True)
 class FreeList:
-    """One walked free list. ``decoded`` = safe-linking was undone."""
+    """One walked free list. ``decoded`` = safe-linking was undone.
+
+    ``arena_id`` names the owning :class:`HeapArena` when the parser tracks
+    arenas (``kind``/``index`` repeat across arenas), else ``None``.
+    """
 
     kind: str
     index: int
@@ -174,6 +243,7 @@ class FreeList:
     chunk_vas: Tuple[int, ...] = ()
     decoded: bool = False
     cycle: bool = False
+    arena_id: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -199,6 +269,7 @@ class HeapLayout:
     confidence: float = 0.0
     diagnostics: Tuple[str, ...] = ()
     coverage: Dict[str, Any] = field(default_factory=dict)
+    arenas: Tuple[HeapArena, ...] = ()
 
     def __post_init__(self) -> None:
         self.chunks = tuple(sorted(self.chunks, key=lambda c: c.va))
@@ -213,6 +284,15 @@ class HeapLayout:
         idx = int(np.searchsorted(self._starts, np.uint64(va), side="right")) - 1
         if idx >= 0 and self.chunks[idx].contains(va):
             return self.chunks[idx]
+        return None
+
+    def arena_kind(self, arena_id: Optional[int]) -> Optional[str]:
+        """``kind`` of the arena with *arena_id*, or ``None`` when unknown."""
+        if arena_id is None:
+            return None
+        for arena in self.arenas:
+            if arena.arena_id == arena_id:
+                return arena.kind
         return None
 
     def role_runs(self, lo: int, hi: int) -> Iterator[Tuple[int, int, HeapRole]]:
@@ -268,7 +348,7 @@ class HeapLayout:
             "allocator": self.allocator.value,
             "version_hint": self.version_hint,
             "platform": asdict(self.platform) if self.platform else None,
-            "regions": [asdict(r) for r in self.regions],
+            "regions": [r.to_dict() for r in self.regions],
             "chunk_count": len(self.chunks),
             "chunks_truncated": len(shown) < len(self.chunks),
             "chunks": [c.to_dict() for c in shown],
@@ -277,12 +357,15 @@ class HeapLayout:
             "confidence": self.confidence,
             "diagnostics": list(self.diagnostics),
             "coverage": _json_safe(self.coverage),
+            "arenas": [a.to_dict() for a in self.arenas],
         }
 
 
 def _free_list_dict(free_list: FreeList) -> Dict[str, Any]:
     data = asdict(free_list)
     data["chunk_vas"] = list(free_list.chunk_vas)
+    data.pop("arena_id")
+    data.update(_arena_id_entry(free_list.arena_id))
     return data
 
 
@@ -303,5 +386,7 @@ def _json_safe(value: Any) -> Any:
 
 __all__ = [
     "AllocatorKind", "ChunkState", "HeapRole", "HeapChunk", "HeapRegion",
-    "FreeList", "Evidence", "HeapLayout",
+    "FreeList", "Evidence", "HeapLayout", "HeapArena",
+    "ARENA_MAIN", "ARENA_THREAD", "ARENA_MMAP", "ARENA_KIND_CODES", "arena_entry",
+    "REGION_MAIN_HEAP", "REGION_THREAD_HEAP", "REGION_MMAPPED_CHUNK",
 ]

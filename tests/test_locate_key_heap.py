@@ -44,6 +44,7 @@ def test_hits_carry_chunk_context(planted):
             "allocator": "ptmalloc2", "chunk_va": chunk.va,
             "chunk_size": chunk.size, "state": ChunkState.IN_USE.value,
             "offset_in_chunk": va - chunk.va, "role": "user_data",
+            "arena": "main",
         }
 
 
@@ -102,3 +103,29 @@ def test_heap_must_parallel_offsets():
     with pytest.raises(ValueError, match="parallel"):
         DumpKeyLocation(dump_path="x", present=True, first_offset=0,
                         hit_count=1, offsets=(0,), heap=(None, None))
+
+
+def test_hit_carries_arena_kind_when_known(tmp_path):
+    from tests.fixtures import synth_heap as sh
+    from tests.test_heap_msl import arena_process_heaps
+
+    heaps, meta = arena_process_heaps()
+    path = sh.as_regioned_raw(tmp_path / "proc", heaps, stem="proc")
+    offsets = [_concat_offset(heaps, meta["thread_key_va"]),
+               _concat_offset(heaps, meta["mmap_key_va"])]
+    source = sh.open_regioned(path)
+    try:
+        hits = heap_hits.heap_hit_annotations(source, offsets, "raw", "auto")
+    finally:
+        source.close()
+    assert [hit["arena"] for hit in hits] == ["thread", "mmap"]
+
+
+def _concat_offset(heaps, va):
+    """Offset of *va* in the byte concatenation of *heaps* (sorted by VA)."""
+    offset = 0
+    for heap in heaps:
+        if heap.base_va <= va < heap.base_va + len(heap.data):
+            return offset + va - heap.base_va
+        offset += len(heap.data)
+    raise AssertionError(f"{va:#x} not mapped")

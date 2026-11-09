@@ -30,7 +30,7 @@ from memdiver.engine.consensus_heap import (
     HeapChunkIndex,
     HeapRoleRuns,
 )
-from memdiver.heap.model import HeapRole
+from memdiver.heap.model import HeapRole, arena_entry
 
 #: Roles the ``"mask"`` policy removes: bytes the allocator owns, which vary
 #: across dumps (pointers, sizes, safe-linked next fields) without ever being
@@ -83,7 +83,8 @@ def _chunk_dict(chunks: Optional[HeapChunkIndex],
         return None
     return {"start": hit["slab_start"], "size": hit["size"],
             "state": hit["state"], "offset_in_chunk": hit["offset_in_chunk"],
-            "agree": hit["agree"]}
+            "agree": hit["agree"],
+            **arena_entry(hit.get("arena"))}
 
 
 def region_heap_annotation(runs: HeapRoleRuns,

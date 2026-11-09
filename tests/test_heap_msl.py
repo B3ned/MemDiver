@@ -84,3 +84,66 @@ def test_analyze_scudo_primary_msl(tmp_path):
         layout = analyze_heap(src)
     assert layout.allocator is AllocatorKind.SCUDO
     assert _chunk_triples(layout.chunks) == _chunk_triples(heap.chunks)
+
+
+# -- VAS-map-only libc (non-imported .msl, no module list) -------------------------
+
+
+def arena_process_heaps(seed: int = 0):
+    """``(heaps, meta)``: main heap, libc ``main_arena`` page, thread arena, mmapped chunk.
+
+    The thread arena's key slot and the mmapped chunk's payload hold 32
+    random bytes seeded by *seed*; ``meta`` has ``thread_key_va`` and
+    ``mmap_key_va``. Heaps are sorted by base VA (= flat-view order).
+    """
+    import random
+
+    rng = random.Random(1000 + seed)
+    main = sh.glibc_heap()
+    libc = sh.glibc_main_arena_page(
+        main.chunks[-1].va, next_arena=sh.thread_arena_va(0x7FFF_E400_0000))
+    thread = sh.glibc_thread_arena(next_arena=libc.meta["arena_va"])
+    key_off = thread.meta["key_va"] - thread.base_va
+    data = bytearray(thread.data)
+    data[key_off:key_off + 32] = bytes(rng.randrange(256) for _ in range(32))
+    thread.data = bytes(data)
+    mmapped = sh.glibc_mmapped_chunk(payload=bytes(rng.randrange(256) for _ in range(32)))
+    meta = {"thread_key_va": thread.meta["key_va"], "mmap_key_va": mmapped.meta["user_va"]}
+    return sorted((main, libc, thread, mmapped), key=lambda h: h.base_va), meta
+
+
+def write_vas_only_msl(path, heaps):
+    """Non-imported ``.msl`` naming libc only in the VAS map (no module list)."""
+    writer = MslWriter(path, os_type=OSType.LINUX, arch_type=ArchType.X86_64,
+                       imported=False)
+    vas = []
+    for heap in heaps:
+        writer.add_memory_region(heap.base_va, heap.data, protection=_RW)
+        vas.append(MslVasEntry(heap.base_va, len(heap.data), _RW, 0,
+                               heap.regions[0][2]))
+    writer.add_vas_map(vas)
+    writer.write()
+    return path
+
+
+def test_vas_named_libc_gets_module_path(tmp_path):
+    heaps, _meta = arena_process_heaps()
+    libc = next(h for h in heaps if h.allocator == "libc")
+    path = write_vas_only_msl(tmp_path / "p.msl", heaps)
+    with open_dump(path) as src:
+        regions = {r.va: r for r in memory_map_of(src)}
+    libc_path = libc.regions[0][2]
+    assert regions[libc.base_va].name == libc_path
+    assert regions[libc.base_va].module_path == libc_path
+    assert all(r.module_path is None for va, r in regions.items() if va != libc.base_va)
+
+
+def test_vas_named_libc_finds_main_arena_ring(tmp_path):
+    heaps, _meta = arena_process_heaps()
+    path = write_vas_only_msl(tmp_path / "p.msl", heaps)
+    with open_dump(path) as src:
+        layout = analyze_heap(src)
+    assert layout.allocator is AllocatorKind.PTMALLOC2
+    assert layout.coverage.get("arena_discovery") == "ring"
+    assert "main_arena_top_va" in layout.coverage
+    assert sorted(a.kind for a in layout.arenas) == ["main", "mmap", "thread"]

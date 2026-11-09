@@ -14,7 +14,7 @@ from ._shared import (
     force_memory_requested,
     keylog_spec_from_args,
 )
-from .heap_report import report_consensus_heap
+from .heap_report import report_consensus_heap, report_session_heap_record
 
 logger = logging.getLogger("memdiver.cli")
 
@@ -207,6 +207,7 @@ def _cmd_consensus_begin(args: argparse.Namespace) -> int:
     """Create a new incremental consensus session persisted on disk."""
     import numpy as np
 
+    from memdiver.app.welford_heap import begin_session_heap, reset_session_heap_dir
     from memdiver.engine.cohorts import require_single_cohort
 
     state_path = Path(args.state)
@@ -229,6 +230,10 @@ def _cmd_consensus_begin(args: argparse.Namespace) -> int:
     }
     if cohort is not None:
         state["cohort"] = cohort
+    # Hand-built Namespaces without --allocator keep the historical state.
+    begin_session_heap(state, getattr(args, "allocator", "off"))
+    # A reused --state path must not merge projections of a previous session.
+    reset_session_heap_dir(state_path)
     state_path.write_text(json.dumps(state, indent=2))
     print(f"Begun consensus session: size={args.size} state={state_path}")
     return 0
@@ -294,6 +299,7 @@ def _cmd_consensus_add(args: argparse.Namespace) -> int:
     import numpy as np
 
     from memdiver.app.composition import open_dump
+    from memdiver.app.welford_heap import record_dump_heap
 
     state_path = Path(args.state)
     state, welford = _load_welford_session(state_path)
@@ -303,6 +309,11 @@ def _cmd_consensus_add(args: argparse.Namespace) -> int:
     with open_dump(Path(args.dump), **_key_material_from_args(args)) as source:
         _warn_tag_status(source)
         data = source.read_all()[:size]
+        heap_record = None
+        if len(data) >= size:   # project while the dump is open
+            heap_record = record_dump_heap(state, state_path, source, size,
+                                           index=int(state["num_dumps"]))
+    report_session_heap_record(heap_record)
     if len(data) < size:
         print(
             f"Dump shorter than consensus size ({len(data)} < {size})",
@@ -332,6 +343,7 @@ def _cmd_consensus_add(args: argparse.Namespace) -> int:
 
 def _cmd_consensus_finalize(args: argparse.Namespace) -> int:
     """Materialize variance + classifications from a persisted session."""
+    from memdiver.app.welford_heap import session_heap_summary
     from memdiver.core.variance import classify_variance, count_classifications
 
     state_path = Path(args.state)
@@ -352,6 +364,9 @@ def _cmd_consensus_finalize(args: argparse.Namespace) -> int:
             "min": float(variance.min()),
         },
     }
+    heap_summary = session_heap_summary(state)
+    if heap_summary is not None:
+        result["heap"] = heap_summary
     _write_output(result, args.output)
     return 0
 

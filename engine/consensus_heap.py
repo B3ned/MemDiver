@@ -44,7 +44,8 @@ from typing import (
 
 import numpy as np
 
-from memdiver.heap.model import ChunkState, HeapLayout, HeapRole
+from memdiver.heap.model import (ARENA_KIND_CODES, ChunkState, HeapLayout,
+                                 HeapRole, arena_entry)
 
 logger = logging.getLogger("memdiver.engine.consensus_heap")
 
@@ -52,12 +53,15 @@ __all__ = [
     "HeapRoleRuns", "HeapChunkIndex", "ConsensusHeap", "compute_consensus_heap",
     "save_heap_npz", "load_heap_npz", "FREED_STATE_VALUES",
     "STATUS_OK", "STATUS_NO_VA", "STATUS_EMPTY", "STATUS_ERROR",
+    "STATUS_UNSUPPORTED", "DumpHeapProjection", "project_dump_heap",
+    "assemble_heap", "has_va_map",
 ]
 
 STATUS_OK = "ok"
 STATUS_NO_VA = "no_va_coordinate"
 STATUS_EMPTY = "empty_consensus"
 STATUS_ERROR = "error"
+STATUS_UNSUPPORTED = "unsupported_allocator"
 
 COORDINATE_ALIGNED = "aligned"
 COORDINATE_FLAT_VIEW = "flat_view"
@@ -73,6 +77,34 @@ FREED_STATE_VALUES: FrozenSet[str] = frozenset(
 #: Key prefix of the chunk-index arrays inside ``heap_roles.npz``.
 _CHUNK_NPZ_PREFIX = "chunk_"
 _CHUNK_NPZ_FIELDS = ("slab_starts", "sizes", "states", "agree")
+#: Optional chunk-index array (absent from files written before it existed).
+_CHUNK_NPZ_ARENA_KINDS = _CHUNK_NPZ_PREFIX + "arena_kinds"
+
+#: Per-chunk arena-kind codes: :data:`memdiver.heap.model.ARENA_KIND_CODES`
+#: (re-exported here, where the npz codecs use them).
+_ARENA_KIND_OTHER = ARENA_KIND_CODES.index("other")
+
+
+def arena_kind_code(kind: Optional[str]) -> int:
+    """uint8 code of arena *kind* (``0`` for ``None``/empty)."""
+    if not kind:
+        return 0
+    try:
+        return ARENA_KIND_CODES.index(kind)
+    except ValueError:
+        return _ARENA_KIND_OTHER
+
+
+def arena_kind_name(code: int) -> str:
+    """Inverse of :func:`arena_kind_code` (``""`` = unknown)."""
+    code = int(code)
+    return ARENA_KIND_CODES[code] if 0 <= code < len(ARENA_KIND_CODES) else ""
+
+
+def _arena_kinds_or_zeros(arena_kinds: Optional[np.ndarray], count: int) -> np.ndarray:
+    if arena_kinds is None:
+        return np.zeros(count, dtype=np.uint8)
+    return np.asarray(arena_kinds, dtype=np.uint8)
 
 #: ``(starts, lengths, roles)`` — one dump's pieces in slab coordinates.
 _Pieces = Tuple[np.ndarray, np.ndarray, np.ndarray]
@@ -261,6 +293,11 @@ class HeapChunkIndex:
     sizes: np.ndarray
     states: np.ndarray
     agree: np.ndarray
+    arena_kinds: Optional[np.ndarray] = None  # ARENA_KIND_CODES; None = all unknown
+
+    def __post_init__(self) -> None:
+        self.arena_kinds = _arena_kinds_or_zeros(self.arena_kinds,
+                                                 int(self.slab_starts.size))
 
     @classmethod
     def empty(cls) -> "HeapChunkIndex":
@@ -278,17 +315,25 @@ class HeapChunkIndex:
             return None
         i = int(idx[0])
         start = int(self.slab_starts[i])
-        return {
+        hit: Dict[str, Any] = {
             "slab_start": start, "size": int(self.sizes[i]),
             "state": _STATE_ORDER[int(self.states[i])].value,
             "agree": int(self.agree[i]),
             "offset_in_chunk": int(slab_offset) - start,
         }
+        return {**hit, **self._arena_entry(i)}
+
+    def _arena_entry(self, i: int) -> Dict[str, str]:
+        """``{"arena": kind}`` when the chunk's arena kind is known, else ``{}``."""
+        assert self.arena_kinds is not None  # set by __post_init__
+        return arena_entry(arena_kind_name(self.arena_kinds[i]))
 
     def to_arrays(self) -> Dict[str, np.ndarray]:
         """The index as ``chunk_*``-prefixed arrays (for ``heap_roles.npz``)."""
-        return {_CHUNK_NPZ_PREFIX + name: getattr(self, name)
-                for name in _CHUNK_NPZ_FIELDS}
+        arrays = {_CHUNK_NPZ_PREFIX + name: getattr(self, name)
+                  for name in _CHUNK_NPZ_FIELDS}
+        arrays[_CHUNK_NPZ_ARENA_KINDS] = self.arena_kinds
+        return arrays
 
     @classmethod
     def from_arrays(cls, data: Any) -> "HeapChunkIndex":
@@ -296,8 +341,11 @@ class HeapChunkIndex:
         keys = [_CHUNK_NPZ_PREFIX + name for name in _CHUNK_NPZ_FIELDS]
         if not all(key in data for key in keys):
             return cls.empty()
+        kinds = (data[_CHUNK_NPZ_ARENA_KINDS] if _CHUNK_NPZ_ARENA_KINDS in data
+                 else None)  # files written before arena kinds: all unknown
         return cls(data[keys[0]].astype(np.int64), data[keys[1]].astype(np.int64),
-                   data[keys[2]].astype(np.uint8), data[keys[3]].astype(np.uint16))
+                   data[keys[2]].astype(np.uint8), data[keys[3]].astype(np.uint16),
+                   kinds)
 
     def to_dict(self) -> Dict[str, Any]:
         by_state: Dict[str, int] = {}
@@ -457,6 +505,11 @@ def _has_va_map(source: Any) -> bool:
             or callable(getattr(source, "va_to_vas_offset", None)))
 
 
+def has_va_map(source: Any) -> bool:
+    """True when *source* carries a VA map (a heap can be projected at all)."""
+    return _has_va_map(source)
+
+
 def _flat_view_runs(source: Any) -> List[Tuple[int, int, int]]:
     """``(va, length, vas_offset)`` of the flat ``"vas"`` view.
 
@@ -486,14 +539,65 @@ def _flat_map(source: Any, slab_size: int) -> Optional[_SlabMap]:
 # -- per-dump analysis ------------------------------------------------------------
 
 
+#: ``DumpHeapProjection`` npz key -> dtype (order = save order).
+_PROJECTION_NPZ_DTYPES: Tuple[Tuple[str, Any], ...] = (
+    ("pieces_starts", np.int64), ("pieces_lengths", np.int64),
+    ("pieces_roles", np.uint8), ("chunk_slabs", np.int64),
+    ("chunk_sizes", np.int64), ("chunk_states", np.uint8))
+#: Optional projection key (absent from npz files written before it existed).
+_PROJECTION_NPZ_ARENA_KINDS = "chunk_arena_kinds"
+
+
 @dataclass(eq=False)  # numpy fields: no elementwise __eq__
-class _DumpProjection:
-    """One dump's heap, projected: role pieces plus chunk starts in slab coords."""
+class DumpHeapProjection:
+    """One dump's heap, projected: role pieces plus chunk starts in slab coords.
+
+    ``pieces`` is ``(starts int64, lengths int64, roles uint8)``; the chunk
+    arrays are ``slabs int64`` (``-1`` = outside the slab), ``sizes int64``
+    and ``states uint8`` (:class:`ChunkState` codes); ``chunk_arena_kinds``
+    holds :data:`ARENA_KIND_CODES` codes (zeros = unknown when not given).
+    """
 
     pieces: _Pieces
     chunk_slabs: np.ndarray
     chunk_sizes: np.ndarray
     chunk_states: np.ndarray
+    chunk_arena_kinds: Optional[np.ndarray] = None
+
+    def __post_init__(self) -> None:
+        self.chunk_arena_kinds = _arena_kinds_or_zeros(
+            self.chunk_arena_kinds, int(np.asarray(self.chunk_slabs).size))
+
+    @property
+    def is_empty(self) -> bool:
+        """True when the dump contributes neither role pieces nor chunks."""
+        return self.pieces[0].size == 0 and self.chunk_slabs.size == 0
+
+    def _arrays(self) -> Tuple[np.ndarray, ...]:
+        return (*self.pieces, self.chunk_slabs, self.chunk_sizes,
+                self.chunk_states)
+
+    def to_npz(self, path: Union[str, Path]) -> None:
+        """Write the arrays to one compressed ``.npz`` (dtypes kept)."""
+        arrays: Dict[str, Any] = {
+            key: np.asarray(arr, dtype=dtype) for (key, dtype), arr
+            in zip(_PROJECTION_NPZ_DTYPES, self._arrays())}
+        arrays[_PROJECTION_NPZ_ARENA_KINDS] = self.chunk_arena_kinds
+        np.savez_compressed(Path(path), **arrays)
+
+    @classmethod
+    def from_npz(cls, path: Union[str, Path]) -> "DumpHeapProjection":
+        """Read a :meth:`to_npz` file back (older files lack arena kinds)."""
+        with np.load(Path(path)) as data:
+            a = [data[key].astype(dtype, copy=False)
+                 for key, dtype in _PROJECTION_NPZ_DTYPES]
+            kinds = (data[_PROJECTION_NPZ_ARENA_KINDS].astype(np.uint8, copy=False)
+                     if _PROJECTION_NPZ_ARENA_KINDS in data else None)
+        return cls((a[0], a[1], a[2]), a[3], a[4], a[5], kinds)
+
+
+#: Backwards-compatible private name.
+_DumpProjection = DumpHeapProjection
 
 
 def _layout_runs(layout: HeapLayout, smap: _SlabMap) -> Tuple[np.ndarray, ...]:
@@ -505,14 +609,22 @@ def _layout_runs(layout: HeapLayout, smap: _SlabMap) -> Tuple[np.ndarray, ...]:
     return vas, lengths, roles
 
 
-def _project_dump(layout: HeapLayout, smap: _SlabMap) -> _DumpProjection:
+def _arena_codes_by_id(layout: HeapLayout) -> Dict[Optional[int], int]:
+    """``{arena_id: arena kind code}`` (first arena wins, as ``arena_kind``)."""
+    return {a.arena_id: arena_kind_code(a.kind) for a in reversed(layout.arenas)}
+
+
+def _project_dump(layout: HeapLayout, smap: _SlabMap) -> DumpHeapProjection:
     chunks = layout.chunks
     vas = np.fromiter((c.va for c in chunks), dtype=np.uint64, count=len(chunks))
     sizes = np.fromiter((c.size for c in chunks), dtype=np.int64, count=len(chunks))
     states = np.fromiter((_STATE_CODE[c.state] for c in chunks),
                          dtype=np.uint8, count=len(chunks))
-    return _DumpProjection(smap.project_runs(*_layout_runs(layout, smap)),
-                           smap.project_points(vas), sizes, states)
+    codes = _arena_codes_by_id(layout)
+    kinds = np.fromiter((codes.get(c.arena_id, 0) for c in chunks),
+                        dtype=np.uint8, count=len(chunks))
+    return DumpHeapProjection(smap.project_runs(*_layout_runs(layout, smap)),
+                           smap.project_points(vas), sizes, states, kinds)
 
 
 def _dump_record(index: int, source: Any,
@@ -559,8 +671,8 @@ def merge_role_pieces(pieces: Sequence[_Pieces], anchor: int = 0) -> HeapRoleRun
     return HeapRoleRuns(starts, lengths, roles, agrees, int(HeapRole.NONE))
 
 
-def _chunk_agreement(anchor: _DumpProjection,
-                     others: Sequence[_DumpProjection]) -> np.ndarray:
+def _chunk_agreement(anchor: DumpHeapProjection,
+                     others: Sequence[DumpHeapProjection]) -> np.ndarray:
     """Per anchor chunk: dumps with a chunk at the same slab start and size."""
     agree = np.zeros(anchor.chunk_slabs.size, dtype=np.uint16)
     for other in others:
@@ -574,15 +686,17 @@ def _chunk_agreement(anchor: _DumpProjection,
     return agree
 
 
-def _chunk_index(anchor: _DumpProjection,
-                 projections: Sequence[_DumpProjection]) -> HeapChunkIndex:
+def _chunk_index(anchor: DumpHeapProjection,
+                 projections: Sequence[DumpHeapProjection]) -> HeapChunkIndex:
     agree = _chunk_agreement(anchor, projections)
     keep = anchor.chunk_slabs >= 0
     order = np.argsort(anchor.chunk_slabs[keep], kind="stable")
+    assert anchor.chunk_arena_kinds is not None  # set by __post_init__
     return HeapChunkIndex(anchor.chunk_slabs[keep][order],
                           anchor.chunk_sizes[keep][order],
                           anchor.chunk_states[keep][order],
-                          agree[keep][order])
+                          agree[keep][order],
+                          anchor.chunk_arena_kinds[keep][order])
 
 
 # -- entry point ------------------------------------------------------------------
@@ -596,11 +710,11 @@ def _slab_maps(cm: Any, sources: Sequence[Any]) -> Tuple[str, List[Optional[_Sla
 
 def _analyze_all(sources: Sequence[Any], maps: Sequence[Optional[_SlabMap]],
                  allocator: str) -> Tuple[List[Optional[HeapLayout]],
-                                          List[Optional[_DumpProjection]]]:
+                                          List[Optional[DumpHeapProjection]]]:
     from memdiver.heap.analyze import analyze_heap
 
     layouts: List[Optional[HeapLayout]] = []
-    projections: List[Optional[_DumpProjection]] = []
+    projections: List[Optional[DumpHeapProjection]] = []
     for source, smap in zip(sources, maps):
         if smap is None or smap.is_empty:
             layouts.append(None)
@@ -630,14 +744,53 @@ def compute_consensus_heap(cm: Any, sources: Sequence[Any],
     per_dump = [_dump_record(i, s, lay)
                 for i, (s, lay) in enumerate(zip(sources, layouts))]
     done = [(i, p) for i, p in enumerate(projections) if p is not None]
-    if not done:
+    return assemble_heap(done, per_dump, allocator, coordinate)
+
+
+def project_dump_heap(source: Any, slab_size: int, allocator: str, *,
+                      index: int = 0) -> Tuple[Optional[DumpHeapProjection],
+                                               Dict[str, Any]]:
+    """Analyse ONE dump and project it onto a flat-view slab of *slab_size*.
+
+    Returns ``(projection, record)``; *record* is the ``per_dump`` entry
+    (``_dump_record`` plus ``"status"``). A source without a VA map yields
+    ``(None, {..., "status": "no_va_coordinate", "reason": "no_va_map"})``.
+    *allocator* is anything :func:`memdiver.heap.analyze.analyze_heap`
+    accepts (a concrete name or ``"auto"``). Analysis errors propagate; the
+    caller decides how to report them.
+    """
+    smap = _flat_map(source, int(slab_size))
+    if smap is None or smap.is_empty:
+        record = _dump_record(index, source, None)
+        record["status"] = STATUS_NO_VA
+        return None, record
+    from memdiver.heap.analyze import analyze_heap
+
+    layout = analyze_heap(source, allocator)
+    record = _dump_record(index, source, layout)
+    record["status"] = STATUS_OK
+    return _project_dump(layout, smap), record
+
+
+def assemble_heap(projections: Sequence[Tuple[int, DumpHeapProjection]],
+                  per_dump: List[Dict[str, Any]], allocator: str,
+                  coordinate: str, *, empty_status: str = STATUS_NO_VA,
+                  **empty_extra: Any) -> ConsensusHeap:
+    """Merge ``(dump_index, projection)`` pairs into one :class:`ConsensusHeap`.
+
+    The first pair is the anchor. A single projection is valid (every
+    ``agree`` is then 1); no projections yields an unavailable result with
+    status *empty_status* (default ``"no_va_coordinate"``), carrying
+    *per_dump* and any *empty_extra* report fields.
+    """
+    if not projections:
         return ConsensusHeap(HeapRoleRuns.empty(), per_dump=per_dump,
-                             report={"status": STATUS_NO_VA, "allocator": allocator,
-                                     "coordinate": coordinate})
-    return _assemble(done, per_dump, allocator, coordinate)
+                             report={"status": empty_status, "allocator": allocator,
+                                     "coordinate": coordinate, **empty_extra})
+    return _assemble(projections, per_dump, allocator, coordinate)
 
 
-def _assemble(done: Sequence[Tuple[int, _DumpProjection]],
+def _assemble(done: Sequence[Tuple[int, DumpHeapProjection]],
               per_dump: List[Dict[str, Any]], allocator: str,
               coordinate: str) -> ConsensusHeap:
     anchor_index, anchor = done[0]

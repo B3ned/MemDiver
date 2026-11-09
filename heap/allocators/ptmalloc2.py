@@ -30,578 +30,84 @@ Corrupt headers are skipped by resyncing to the next aligned header whose
 successor is also plausible (a diagnostic names the address); pages the
 dump never captured are skipped the same way and counted in ``coverage``.
 
+Thread arenas (ptmalloc2 only, see :mod:`.ptmalloc2_arenas`): reached from
+``main_arena.next`` (the arena ring) or, when ``main_arena`` is unavailable,
+by scanning ``HEAP_MAX_SIZE``-aligned anonymous maps for ``heap_info``. Each
+of their heaps is walked as a ``thread_heap`` segment of arena 1..n; the
+arena's tcache and (ring discovery only) bins are decoded. With an explicit
+:attr:`ParseOptions.regions`, a thread heap is walked only when its region
+is selected. Mmapped chunks (IS_MMAPPED) are found by a page-granular
+scan of the remaining anonymous maps (:mod:`.ptmalloc2_mmapped`), as in-use
+chunks of an ``mmap`` pseudo arena; the scan only runs when a main heap was
+walked or a thread arena found (mmapped chunks alone give an empty layout).
+
 Limitations: only the regions named like the main heap (``[heap]``; for
-dlmalloc also ``[anon:libc_malloc]``) are walked unless
-:attr:`ParseOptions.regions` selects others. Non-main arenas (``heap_info``
-at 64 MiB-aligned anonymous maps) and their ``malloc_state`` are not
-decoded, mmapped chunks are not enumerated, and ``main_arena`` is not found
-in statically linked binaries (no glibc module mapping). Each of these
-produces a diagnostic instead of a guess.
+dlmalloc also ``[anon:libc_malloc]``) and discovered thread heaps are
+walked unless :attr:`ParseOptions.regions` selects others. ``main_arena``
+is not found in statically linked binaries (no glibc module mapping; thread
+arenas are then found by the ``heap_info`` scan but their bins are not
+decoded), one ``malloc_state`` top offset is assumed for every arena, and
+dlmalloc mmapped chunks are not enumerated. The static-binary case adds a
+diagnostic instead of a guess.
 """
 
 from __future__ import annotations
 
-import os
-from collections import OrderedDict
-from dataclasses import dataclass, field
-from fnmatch import fnmatch
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from memdiver.heap.allocators.ptmalloc2_arenas import (ArenaDiscovery,
+                                                       arena_flag_check,
+                                                       discover_thread_arenas,
+                                                       is_thread_heap_region,
+                                                       thread_heap_arena)
+from memdiver.heap.allocators.ptmalloc2_bins import (
+    _Lists, _mark_tcache_struct, _mark_tcache_struct_at, _decode_tcache, _version_hint,
+    _libc_data_regions, _decode_arena as _decode_arena, _decode_arena_at,
+    _locate_main_arena, _decode_main_arena,
+)
+from memdiver.heap.allocators.ptmalloc2_mmapped import (MmapScan, claimed_ranges,
+                                                        scan_mmapped_chunks,
+                                                        starts_with_mmapped_chunk)
+from memdiver.heap.allocators.ptmalloc2_segments import (MAIN_ARENA_ID, WalkSpan,
+                                                         assemble_layout, main_arena,
+                                                         main_heap_segment)
+from memdiver.heap.allocators.ptmalloc2_walk import (
+    _PREV_INUSE, _IS_MMAPPED, _NON_MAIN_ARENA, _FLAG_BITS, _PROBE_HEADERS, _PROBE_REGIONS,
+    _GLIBC_MODULES, _Geometry, _geometry, _Flavor, _PTMALLOC2, _DLMALLOC, _PagedReader, _Walk,
+    _header_word, _walk_region, _Slot, _initial_slot, _Heap,
+)
 from memdiver.heap.memory import VaMemory
-from memdiver.heap.model import (AllocatorKind, ChunkState, Evidence, FreeList,
-                                 HeapChunk, HeapLayout, HeapRegion, HeapRole)
+from memdiver.heap.model import (AllocatorKind, ChunkState, Evidence, HeapArena,
+                                 HeapChunk, HeapLayout)
 from memdiver.heap.platform import MappedRegion, TargetPlatform
 from memdiver.heap.registry import (DetectContext, DetectScore, ParseOptions,
                                     name_matches)
-
-_PREV_INUSE = 0x1
-_IS_MMAPPED = 0x2        # dlmalloc: CINUSE_BIT
-_NON_MAIN_ARENA = 0x4
-_FLAG_BITS = 0x7
-_TCACHE_BINS = 64
-_NBINS = 128
-_FIRST_LARGE_BIN = 64
-_DL_MIN_LARGE_SIZE = 0x100
-_PAGE = 0x1000
-_PROBE_HEADERS = 32
-_PROBE_REGIONS = 4
-_MAX_LIST_LEN = 4096
-_MAX_ARENA_SCAN = 8 << 20
-_CACHE_PAGES = 256
-_GLIBC_MODULES = ("libc.so.6", "libc-2.*.so", "libc.so")
-
-_Roles = Tuple[Tuple[int, int, HeapRole], ...]
-
-
-# -- geometry & flavours ----------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _Geometry:
-    """Word size, endianness and the alignment derived from them."""
-
-    ptr: int
-    endian: str
-
-    @property
-    def align(self) -> int:
-        return 2 * self.ptr
-
-    @property
-    def header(self) -> int:
-        return 2 * self.ptr
-
-    @property
-    def min_chunk(self) -> int:
-        return 4 * self.ptr
-
-    def align_up(self, va: int) -> int:
-        return (va + self.align - 1) & ~(self.align - 1)
-
-    def pack(self, value: int) -> bytes:
-        return value.to_bytes(self.ptr, "big" if self.endian == "big" else "little")
-
-
-def _geometry(platform: TargetPlatform) -> _Geometry:
-    return _Geometry(platform.pointer_size, platform.endianness)
-
-
-@dataclass(frozen=True)
-class _Flavor:
-    kind: AllocatorKind
-    region_patterns: Tuple[str, ...]
-    dlmalloc: bool
-
-
-_PTMALLOC2 = _Flavor(AllocatorKind.PTMALLOC2, ("[heap]",), False)
-_DLMALLOC = _Flavor(AllocatorKind.DLMALLOC,
-                    ("[heap]", "[anon:libc_malloc]", "*dlmalloc*"), True)
-
-
-# -- paged reads --------------------------------------------------------------------
-
-
-class _PagedReader:
-    """Word reads by VA through a small LRU cache of page-sized reads."""
-
-    def __init__(self, memory: VaMemory, geo: _Geometry):
-        self._memory = memory
-        self._geo = geo
-        self._pages: "OrderedDict[int, Optional[bytes]]" = OrderedDict()
-
-    def read(self, va: int, n: int) -> Optional[bytes]:
-        page_va = va & ~(_PAGE - 1)
-        page = self._page(page_va) if va + n <= page_va + _PAGE else None
-        if page is None:
-            return self._memory.read(va, n)
-        return page[va - page_va:va - page_va + n]
-
-    def _page(self, page_va: int) -> Optional[bytes]:
-        if page_va in self._pages:
-            self._pages.move_to_end(page_va)
-            return self._pages[page_va]
-        data = self._memory.read(page_va, _PAGE)
-        self._pages[page_va] = data
-        if len(self._pages) > _CACHE_PAGES:
-            self._pages.popitem(last=False)
-        return data
-
-    def uint(self, va: int, width: int) -> Optional[int]:
-        data = self.read(va, width)
-        if data is None:
-            return None
-        return int.from_bytes(data, "big" if self._geo.endian == "big" else "little")
-
-    def word(self, va: int) -> Optional[int]:
-        return self.uint(va, self._geo.ptr)
-
-
-# -- boundary-tag walk --------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _Raw:
-    """One walked chunk header. ``after_gap``: a resync/hole precedes it."""
-
-    va: int
-    size: int
-    flags: int
-    after_gap: bool
-    region_end: int
-
-    @property
-    def end(self) -> int:
-        return self.va + self.size
-
-
-@dataclass
-class _Walk:
-    raws: List[_Raw] = field(default_factory=list)
-    diagnostics: List[str] = field(default_factory=list)
-    skipped: int = 0
-    uncaptured: int = 0
-    truncated: bool = False
-
-
-def _plausible(word: int, va: int, end: int, geo: _Geometry, flavor: _Flavor) -> bool:
-    size = word & ~_FLAG_BITS
-    if size < geo.min_chunk or size % geo.align or va + size > end:
-        return False
-    return flavor.dlmalloc or not word & _IS_MMAPPED
-
-
-def _header_word(reader: _PagedReader, va: int, end: int, geo: _Geometry,
-                 flavor: _Flavor) -> Optional[int]:
-    """The size word at *va* when it forms a plausible header, else ``None``."""
-    word = reader.word(va + geo.ptr)
-    if word is None or not _plausible(word, va, end, geo, flavor):
-        return None
-    return word
-
-
-def _resync(reader: _PagedReader, start: int, end: int, geo: _Geometry,
-            flavor: _Flavor) -> int:
-    """First aligned VA >= *start* whose header and successor are plausible."""
-    va = geo.align_up(start)
-    while va + geo.header <= end:
-        word = _header_word(reader, va, end, geo, flavor)
-        if word is not None:
-            nxt = va + (word & ~_FLAG_BITS)
-            if nxt == end or _header_word(reader, nxt, end, geo, flavor) is not None:
-                return va
-        va += geo.align
-    return end
-
-
-def _walk_region(reader: _PagedReader, region: MappedRegion, geo: _Geometry,
-                 flavor: _Flavor, budget: int, walk: _Walk) -> None:
-    va, end, gap = geo.align_up(region.va), region.end, False
-    while va + geo.header <= end:
-        if len(walk.raws) >= budget:
-            walk.truncated = True
-            return
-        word = reader.word(va + geo.ptr)
-        if word is not None and _plausible(word, va, end, geo, flavor):
-            walk.raws.append(_Raw(va, word & ~_FLAG_BITS, word & _FLAG_BITS, gap, end))
-            va, gap = va + (word & ~_FLAG_BITS), False
-            continue
-        va, gap = _skip_bad_header(reader, va, word, end, geo, flavor, walk), True
-
-
-def _skip_bad_header(reader: _PagedReader, va: int, word: Optional[int], end: int,
-                     geo: _Geometry, flavor: _Flavor, walk: _Walk) -> int:
-    """Record why *va* is unusable and return where the walk resumes."""
-    if word is None:
-        hole_end = min((va & ~(_PAGE - 1)) + _PAGE, end)
-        walk.uncaptured += hole_end - va
-        resume = _resync(reader, hole_end, end, geo, flavor)
-        walk.skipped += resume - hole_end
-        return resume
-    walk.diagnostics.append(
-        f"implausible chunk header at {va:#x} (size word {word:#x}); resyncing")
-    resume = _resync(reader, va + geo.align, end, geo, flavor)
-    walk.skipped += resume - va
-    if resume < end:
-        walk.diagnostics.append(f"resynced at {resume:#x}")
-    return resume
-
-
-# -- chunk classification -------------------------------------------------------------
-
-
-@dataclass
-class _Slot:
-    """A walked chunk plus the state/bin/roles the overlays assign to it."""
-
-    raw: _Raw
-    state: ChunkState
-    bin: Optional[str] = None
-    roles: Optional[_Roles] = None
-    extra: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def reserved(self) -> bool:
-        """Top chunk or allocator metadata: never a free-list member."""
-        return self.bin == "top" or bool(self.extra.get("meta"))
-
-
-def _link_roles(geo: _Geometry, words: int) -> _Roles:
-    return tuple((geo.header + i * geo.ptr, geo.ptr, HeapRole.FREE_LINK)
-                 for i in range(words))
-
-
-def _successor(raws: Sequence[_Raw], idx: int) -> Optional[_Raw]:
-    if idx + 1 >= len(raws):
-        return None
-    nxt = raws[idx + 1]
-    return nxt if nxt.va == raws[idx].end and not nxt.after_gap else None
-
-
-def _base_state(raw: _Raw, nxt: Optional[_Raw], flavor: _Flavor) -> ChunkState:
-    if flavor.dlmalloc:
-        return ChunkState.IN_USE if raw.flags & _IS_MMAPPED else ChunkState.FREE
-    if nxt is None:
-        return ChunkState.UNKNOWN
-    return ChunkState.IN_USE if nxt.flags & _PREV_INUSE else ChunkState.FREE
-
-
-def _is_top(raw: _Raw, flavor: _Flavor) -> bool:
-    if raw.end != raw.region_end:
-        return False
-    return not (flavor.dlmalloc and raw.flags & _IS_MMAPPED)
-
-
-def _initial_slot(raws: Sequence[_Raw], idx: int, geo: _Geometry,
-                  flavor: _Flavor) -> _Slot:
-    raw = raws[idx]
-    if _is_top(raw, flavor):
-        return _Slot(raw, ChunkState.FREE, "top")
-    slot = _Slot(raw, _base_state(raw, _successor(raws, idx), flavor))
-    if slot.state is ChunkState.FREE:
-        slot.roles = _link_roles(geo, 2)
-        if flavor.dlmalloc:
-            slot.bin = "smallbin" if raw.size < _DL_MIN_LARGE_SIZE else "treebin"
-    return slot
-
-
-class _Heap:
-    """Walked slots indexed by chunk VA, plus the heap regions' extents."""
-
-    def __init__(self, slots: List[_Slot], regions: Sequence[MappedRegion]):
-        self.slots = slots
-        self.by_va = {slot.raw.va: slot for slot in slots}
-        self._extents = [(r.va, r.end) for r in regions]
-
-    def free_candidate(self, chunk_va: int) -> Optional[int]:
-        slot = self.by_va.get(chunk_va)
-        return chunk_va if slot is not None and not slot.reserved else None
-
-    def contains(self, va: int) -> bool:
-        return any(lo <= va < hi for lo, hi in self._extents)
-
-    def top(self) -> Optional[_Slot]:
-        return next((s for s in self.slots if s.bin == "top"), None)
-
-
-# -- free-list walks ------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _Chain:
-    nodes: Tuple[int, ...]
-    cycle: bool = False
-    broken: bool = False
-
-
-def _reveal(pos: int, stored: int) -> int:
-    """glibc >= 2.32 ``REVEAL_PTR``: ``(pos >> 12) ^ stored``."""
-    return (pos >> 12) ^ stored
-
-
-def _walk_singly(reader: _PagedReader, first: int, link_offset: int, safe: bool,
-                 to_chunk: Callable[[int], Optional[int]]) -> _Chain:
-    """Follow a NULL-terminated list whose link sits at ``node + link_offset``."""
-    nodes: List[int] = []
-    node = first
-    while node:
-        chunk_va = to_chunk(node)
-        if chunk_va is None or len(nodes) >= _MAX_LIST_LEN:
-            return _Chain(tuple(nodes), broken=True)
-        if chunk_va in nodes:
-            return _Chain(tuple(nodes), cycle=True)
-        nodes.append(chunk_va)
-        stored = reader.word(node + link_offset)
-        if stored is None:
-            return _Chain(tuple(nodes), broken=True)
-        node = _reveal(node + link_offset, stored) if safe else stored
-    return _Chain(tuple(nodes))
-
-
-def _walk_double(reader: _PagedReader, header_va: int, geo: _Geometry,
-                 to_chunk: Callable[[int], Optional[int]]) -> _Chain:
-    """Follow ``fd`` from a circular bin header back to itself."""
-    nodes: List[int] = []
-    node = reader.word(header_va + geo.header)
-    while node is not None and node != header_va:
-        if to_chunk(node) is None or len(nodes) >= _MAX_LIST_LEN:
-            return _Chain(tuple(nodes), broken=True)
-        if node in nodes:
-            return _Chain(tuple(nodes), cycle=True)
-        nodes.append(node)
-        node = reader.word(node + geo.header)
-    return _Chain(tuple(nodes), broken=node is None)
-
-
-def _chains_badness(chains: Sequence[_Chain]) -> Tuple[int, int]:
-    return (sum(c.broken or c.cycle for c in chains), -sum(len(c.nodes) for c in chains))
-
-
-def _pick_decoding(walk: Callable[[bool], List[_Chain]],
-                   hint: Optional[bool]) -> Tuple[Optional[bool], List[_Chain]]:
-    """Decode plain and safe-linked; keep whichever forms in-heap chains.
-
-    Returns ``(safe, chains)``; ``safe`` is ``None`` when neither wins.
-    """
-    if hint is not None:
-        return hint, walk(hint)
-    plain, safe = walk(False), walk(True)
-    if _chains_badness(safe) < _chains_badness(plain):
-        return True, safe
-    if _chains_badness(plain) < _chains_badness(safe):
-        return False, plain
-    return None, plain
-
-
-@dataclass
-class _Lists:
-    """Free lists found so far, their diagnostics and the safe-linking verdict."""
-
-    free_lists: List[FreeList] = field(default_factory=list)
-    diagnostics: List[str] = field(default_factory=list)
-    safe: Optional[bool] = None
-
-
-def _record(lists: _Lists, kind: str, index: int, head_va: int, chain: _Chain,
-            decoded: bool) -> None:
-    lists.free_lists.append(FreeList(kind, index, head_va, chain.nodes, decoded,
-                                     chain.cycle))
-    if chain.cycle:
-        lists.diagnostics.append(f"{kind}[{index}] contains a cycle")
-    elif chain.broken:
-        lists.diagnostics.append(
-            f"{kind}[{index}] ends at an invalid or uncaptured pointer "
-            f"after {len(chain.nodes)} chunk(s)")
-
-
-def _mark(heap: _Heap, chain: _Chain, state: ChunkState, label: str,
-          roles: _Roles) -> None:
-    for chunk_va in chain.nodes:
-        slot = heap.by_va[chunk_va]
-        slot.state, slot.bin, slot.roles = state, label, roles
-
-
-# -- tcache ---------------------------------------------------------------------------
-
-
-def _tcache_struct_sizes(geo: _Geometry) -> Dict[int, int]:
-    """Chunk size of ``tcache_perthread_struct`` -> width of ``counts[]``."""
-    sizes: Dict[int, int] = {}
-    for width in (2, 1):
-        request = width * _TCACHE_BINS + geo.ptr * _TCACHE_BINS
-        sizes[(request + geo.ptr + geo.align - 1) & ~(geo.align - 1)] = width
-    return sizes
-
-
-_VERSION_BY_WIDTH = {2: "glibc>=2.30", 1: "glibc 2.26-2.29"}
-
-
-def _mark_tcache_struct(heap: _Heap, geo: _Geometry) -> Optional[_Slot]:
-    """Flag the heap's first chunk as ``tcache_perthread_struct`` when it fits."""
-    if not heap.slots:
-        return None
-    first = heap.slots[0]
-    width = _tcache_struct_sizes(geo).get(first.raw.size)
-    if width is None or first.bin == "top":
-        return None
-    first.state, first.bin, first.roles = (ChunkState.IN_USE,
-                                           "tcache_perthread_struct", None)
-    first.extra = {"meta": True, "struct": "tcache_perthread_struct",
-                   "counts_width": width}
-    return first
-
-
-def _tcache_heads(reader: _PagedReader, struct_slot: _Slot,
-                  geo: _Geometry) -> Iterator[Tuple[int, int, int, int]]:
-    """``(index, count, entry_slot_va, head)`` for every non-empty bin."""
-    width = struct_slot.extra["counts_width"]
-    counts_va = struct_slot.raw.va + geo.header
-    entries_va = counts_va + width * _TCACHE_BINS
-    for idx in range(_TCACHE_BINS):
-        head = reader.word(entries_va + idx * geo.ptr)
-        if head:
-            count = reader.uint(counts_va + idx * width, width) or 0
-            yield idx, count, entries_va + idx * geo.ptr, head
-
-
-def _decode_tcache(reader: _PagedReader, heap: _Heap, struct_slot: _Slot,
-                   geo: _Geometry, lists: _Lists) -> None:
-    heads = list(_tcache_heads(reader, struct_slot, geo))
-
-    def user_to_chunk(mem: int) -> Optional[int]:
-        return heap.free_candidate(mem - geo.header) if mem % geo.align == 0 else None
-
-    def walk(safe: bool) -> List[_Chain]:
-        return [_walk_singly(reader, head, 0, safe, user_to_chunk)
-                for _i, _c, _s, head in heads]
-
-    lists.safe, chains = _pick_decoding(walk, None)
-    for (idx, count, slot_va, _head), chain in zip(heads, chains):
-        _record(lists, "tcache", idx, slot_va, chain, bool(lists.safe))
-        _mark(heap, chain, ChunkState.CACHED, f"tcache[{idx}]", _link_roles(geo, 2))
-        if count != len(chain.nodes):
-            lists.diagnostics.append(
-                f"tcache[{idx}] count {count} != walked length {len(chain.nodes)}")
-
-
-def _version_hint(struct_slot: Optional[_Slot], safe: Optional[bool]) -> str:
-    if struct_slot is None:
-        return "glibc<2.26 or tcache disabled"
-    width = struct_slot.extra["counts_width"]
-    if width == 2 and safe is True:
-        return "glibc>=2.32"
-    if width == 2 and safe is False:
-        return "glibc 2.30-2.31"
-    return _VERSION_BY_WIDTH[width]
-
-
-# -- main_arena -----------------------------------------------------------------------
-
-
-def _libc_data_regions(regions: Sequence[MappedRegion]) -> List[MappedRegion]:
-    return [r for r in regions
-            if "w" in r.perms and r.captured and r.size <= _MAX_ARENA_SCAN
-            and r.module_path
-            and any(fnmatch(os.path.basename(r.module_path), p) for p in _GLIBC_MODULES)]
-
-
-def _aligned_hits(data: bytes, needle: bytes, step: int) -> Iterator[int]:
-    pos = data.find(needle)
-    while pos >= 0:
-        if pos % step == 0:
-            yield pos
-        pos = data.find(needle, pos + 1)
-
-
-def _bins_consistent(reader: _PagedReader, top_slot_va: int, geo: _Geometry,
-                     heap: _Heap) -> bool:
-    """Every ``bins[]`` pair is self-linked (empty) or points into the heap."""
-    words = [reader.word(top_slot_va + (2 + i) * geo.ptr) for i in range(2 * _NBINS - 2)]
-    empty = 0
-    for pair in range(_NBINS - 1):
-        header_va = top_slot_va + 2 * pair * geo.ptr
-        fd, bk = words[2 * pair], words[2 * pair + 1]
-        if fd is None or bk is None:
-            return False
-        if fd == bk == header_va:
-            empty += 1
-        elif not (heap.contains(fd) and heap.contains(bk)):
-            return False
-    return empty > 0
-
-
-def _find_main_arena(memory: VaMemory, reader: _PagedReader, regions: Sequence[MappedRegion],
-                     geo: _Geometry, heap: _Heap, top_va: int) -> Optional[int]:
-    """VA of ``main_arena.top`` inside glibc's writable data, or ``None``."""
-    needle = geo.pack(top_va)
-    for region in _libc_data_regions(regions):
-        data = memory.read(region.va, region.size)
-        if data is None:
-            continue
-        for offset in _aligned_hits(data, needle, geo.ptr):
-            if _bins_consistent(reader, region.va + offset, geo, heap):
-                return region.va + offset
-    return None
-
-
-def _nfastbins(geo: _Geometry) -> int:
-    """``NFASTBINS = fastbin_index(request2size(MAX_FAST_SIZE)) + 1``."""
-    max_fast = 80 * geo.ptr // 4
-    request = max(geo.min_chunk, (max_fast + geo.ptr + geo.align - 1) & ~(geo.align - 1))
-    return (request >> (4 if geo.ptr == 8 else 3)) - 2 + 1
-
-
-def _decode_fastbins(reader: _PagedReader, heap: _Heap, top_slot_va: int,
-                     geo: _Geometry, lists: _Lists) -> None:
-    base = top_slot_va - _nfastbins(geo) * geo.ptr
-    heads = [(i, base + i * geo.ptr, reader.word(base + i * geo.ptr))
-             for i in range(_nfastbins(geo))]
-    present = [(i, slot_va, head) for i, slot_va, head in heads if head]
-
-    def walk(safe: bool) -> List[_Chain]:
-        return [_walk_singly(reader, head, geo.header, safe, heap.free_candidate)
-                for _i, _s, head in present]
-
-    safe, chains = _pick_decoding(walk, lists.safe)
-    for (idx, slot_va, _head), chain in zip(present, chains):
-        _record(lists, "fastbin", idx, slot_va, chain, bool(safe))
-        _mark(heap, chain, ChunkState.CACHED, f"fastbin[{idx}]", _link_roles(geo, 1))
-
-
-def _bin_label(index: int) -> Tuple[str, str, int]:
-    """``(kind, label, link words)`` of ``bin_at(index)``."""
-    if index == 1:
-        return "unsorted", "unsorted", 2
-    if index < _FIRST_LARGE_BIN:
-        return "smallbin", f"smallbin[{index}]", 2
-    return "largebin", f"largebin[{index}]", 4
-
-
-def _decode_bins(reader: _PagedReader, heap: _Heap, top_slot_va: int,
-                 geo: _Geometry, lists: _Lists) -> None:
-    for index in range(1, _NBINS - 1):
-        header_va = top_slot_va + 2 * (index - 1) * geo.ptr
-        chain = _walk_double(reader, header_va, geo, heap.free_candidate)
-        if not chain.nodes and not chain.broken:
-            continue
-        kind, label, words = _bin_label(index)
-        _record(lists, kind, index, header_va, chain, False)
-        _mark(heap, chain, ChunkState.FREE, label, _link_roles(geo, words))
-
-
-def _decode_arena(memory: VaMemory, reader: _PagedReader, ctx: DetectContext,
-                  heap: _Heap, geo: _Geometry, lists: _Lists) -> Optional[int]:
-    top = heap.top()
-    arena_top = (None if top is None else
-                 _find_main_arena(memory, reader, ctx.regions, geo, heap, top.raw.va))
-    if arena_top is None:
-        lists.diagnostics.append(
-            "main_arena not found (no captured glibc data mapping referencing the "
-            "top chunk): fastbin/unsorted/small/large bins not decoded, fastbin "
-            "chunks appear in use")
-        return None
-    _decode_fastbins(reader, heap, arena_top, geo, lists)
-    _decode_bins(reader, heap, arena_top, geo, lists)
-    return arena_top
+from memdiver.heap.segments import ChunkBudget, HeapSegment, truncation_diagnostic
+
+# The boundary-tag walker lives in ptmalloc2_walk and the free-list decoders in
+# ptmalloc2_bins; their remaining names are re-exported (``name as name``) so
+# everything stays importable from this module.
+from memdiver.heap.allocators.ptmalloc2_bins import (
+    _Chain as _Chain, _reveal as _reveal, _walk_singly as _walk_singly,
+    _walk_double as _walk_double, _chains_badness as _chains_badness,
+    _pick_decoding as _pick_decoding, _record as _record, _mark as _mark,
+    _tcache_struct_sizes as _tcache_struct_sizes, _VERSION_BY_WIDTH as _VERSION_BY_WIDTH,
+    _tcache_heads as _tcache_heads, _aligned_hits as _aligned_hits,
+    _bins_consistent as _bins_consistent, _find_main_arena as _find_main_arena,
+    _nfastbins as _nfastbins, _decode_fastbins as _decode_fastbins, _bin_label as _bin_label,
+    _decode_bins as _decode_bins,
+)
+from memdiver.heap.allocators.ptmalloc2_walk import (
+    _TCACHE_BINS as _TCACHE_BINS, _NBINS as _NBINS, _FIRST_LARGE_BIN as _FIRST_LARGE_BIN,
+    _DL_MIN_LARGE_SIZE as _DL_MIN_LARGE_SIZE, _PAGE as _PAGE, _MAX_LIST_LEN as _MAX_LIST_LEN,
+    _MAX_ARENA_SCAN as _MAX_ARENA_SCAN, _CACHE_PAGES as _CACHE_PAGES, _Roles as _Roles,
+    _Raw as _Raw, _plausible as _plausible, _resync as _resync,
+    _ends_with_fencepost as _ends_with_fencepost, _skip_bad_header as _skip_bad_header,
+    _link_roles as _link_roles, _successor as _successor, _base_state as _base_state,
+    _is_top as _is_top,
+)
+from memdiver.heap.allocators.ptmalloc2_walk import is_fencepost as is_fencepost
+from memdiver.heap.model import FreeList as FreeList, HeapRole as HeapRole
 
 
 # -- region selection ----------------------------------------------------------------
@@ -716,12 +222,39 @@ def probe_dlmalloc(ctx: DetectContext) -> DetectScore:
 def _walk_all(reader: _PagedReader, regions: Sequence[MappedRegion], geo: _Geometry,
               flavor: _Flavor, max_chunks: int) -> _Walk:
     walk = _Walk()
-    for region in regions:
-        _walk_region(reader, region, geo, flavor, max_chunks, walk)
-        if walk.truncated:
-            walk.diagnostics.append(f"stopped after max_chunks={max_chunks} chunks")
-            break
+    _walk_segments(reader, [main_heap_segment(r) for r in regions], geo, flavor,
+                   max_chunks, walk)
     return walk
+
+
+def _walk_segments(reader: _PagedReader, segments: Sequence[HeapSegment], geo: _Geometry,
+                   flavor: _Flavor, max_chunks: int, walk: _Walk) -> None:
+    """Walk *segments* in order into *walk*, sharing its ``max_chunks`` budget."""
+    for segment in segments:
+        if not walk.truncated:
+            _walk_segment(reader, segment, geo, flavor, max_chunks, walk)
+            if walk.truncated:
+                walk.diagnostics.append(truncation_diagnostic(max_chunks))
+        else:
+            first = len(walk.raws)
+            walk.spans.append(WalkSpan(segment, first, first))
+
+
+def _walk_segment(reader: _PagedReader, segment: HeapSegment, geo: _Geometry,
+                  flavor: _Flavor, max_chunks: int, walk: _Walk) -> None:
+    """Walk *segment* from ``walk_start`` and record its :class:`WalkSpan`.
+
+    Bytes before ``walk_start`` (a thread heap's ``heap_info`` and
+    ``malloc_state``) are decoded metadata and count as walked.
+    """
+    first, skipped, uncaptured = len(walk.raws), walk.skipped, walk.uncaptured
+    region = MappedRegion(segment.va, segment.size, "rw-", segment.name, None, True)
+    _walk_region(reader, region, geo, flavor, max_chunks, walk,
+                 start=segment.walk_start, end=segment.end)
+    walk.spans.append(WalkSpan(
+        segment, first, len(walk.raws),
+        walked=segment.walk_start - segment.va + sum(r.size for r in walk.raws[first:]),
+        skipped=walk.skipped - skipped, uncaptured=walk.uncaptured - uncaptured))
 
 
 _LINKED_STATES = (ChunkState.FREE, ChunkState.CACHED)
@@ -742,42 +275,118 @@ def _header_fields(reader: _PagedReader, slot: _Slot, geo: _Geometry) -> Dict[st
     return {name: word for name, word in fields.items() if word is not None}
 
 
-def _to_chunk(reader: _PagedReader, slot: _Slot, geo: _Geometry) -> HeapChunk:
+def _to_chunk(reader: _PagedReader, slot: _Slot, geo: _Geometry,
+              arena_id: Optional[int] = None) -> HeapChunk:
     raw = slot.raw
     extra = {**_header_fields(reader, slot, geo), **slot.extra}
     return HeapChunk(va=raw.va, size=raw.size, state=slot.state, header_len=geo.header,
                      user_va=raw.va + geo.header, user_len=raw.size - geo.header,
                      flags=raw.flags, bin=slot.bin, extra=extra,
-                     confidence=0.7 if raw.after_gap else 1.0, roles=slot.roles)
+                     confidence=0.7 if raw.after_gap else 1.0, roles=slot.roles,
+                     arena_id=arena_id)
 
 
-def _coverage(regions: Sequence[MappedRegion], walk: _Walk,
-              arena_top: Optional[int], safe: Optional[bool]) -> Dict[str, Any]:
+def _walked_chunks(reader: _PagedReader, heap: _Heap, walk: _Walk,
+                   geo: _Geometry) -> List[HeapChunk]:
+    """Every walked slot as a chunk, already carrying its segment's ``arena_id``."""
+    return [_to_chunk(reader, slot, geo, span.segment.arena_id)
+            for span in walk.spans for slot in heap.slots[span.first:span.stop]]
+
+
+def _coverage(arena_top: Optional[int], safe: Optional[bool], threads: ArenaDiscovery,
+              mmapped: MmapScan) -> Dict[str, Any]:
+    """The ptmalloc2-specific coverage keys (the assembler adds the standard ones)."""
     return {
-        "regions": [r.name or hex(r.va) for r in regions],
-        "bytes_total": sum(r.size for r in regions),
-        "bytes_walked": sum(raw.size for raw in walk.raws),
-        "bytes_skipped": walk.skipped,
-        "bytes_uncaptured": walk.uncaptured,
-        "chunk_count": len(walk.raws),
-        "truncated": walk.truncated,
         "main_arena_top_va": arena_top,
         "safe_linking": safe,
+        "thread_arenas": len(threads.arenas),
+        "arena_discovery": threads.method,
+        "mmapped_chunks": len(mmapped.chunks),
     }
 
 
 def _ptmalloc2_overlays(memory: VaMemory, reader: _PagedReader, ctx: DetectContext,
-                        heap: _Heap, geo: _Geometry,
-                        lists: _Lists) -> Tuple[str, Optional[int]]:
-    """Tcache + arena decoding; returns ``(version_hint, main_arena top VA)``."""
+                        opts: ParseOptions, heap: _Heap, walk: _Walk, geo: _Geometry,
+                        lists: _Lists) -> Tuple[str, Optional[int], ArenaDiscovery]:
+    """Tcache + main/thread arena decoding: ``(version_hint, main top slot, threads)``.
+
+    Every heap (main and thread) is walked before any free list is decoded,
+    so a list may lead into another arena's heap (a cross-thread free puts
+    a thread arena's chunk into the freeing thread's tcache).
+    """
     struct_slot = _mark_tcache_struct(heap, geo)
+    arena_top = _locate_main_arena(memory, reader, ctx, heap, geo)
+    threads = _walk_thread_arenas(reader, ctx, opts, heap, walk, geo, arena_top)
     if struct_slot is not None:
         _decode_tcache(reader, heap, struct_slot, geo, lists)
-    arena_top = _decode_arena(memory, reader, ctx, heap, geo, lists)
-    if any(s.raw.flags & _NON_MAIN_ARENA for s in heap.slots):
+    _decode_main_arena(reader, heap, arena_top, geo, lists)
+    lists.diagnostics.extend(threads.diagnostics)
+    _decode_thread_arenas(reader, heap, walk, geo, lists, threads)
+    if not threads.arenas and any(s.raw.flags & _NON_MAIN_ARENA for s in heap.slots):
         lists.diagnostics.append(
             "NON_MAIN_ARENA chunks present; non-main arenas are not decoded")
-    return _version_hint(struct_slot, lists.safe), arena_top
+    if struct_slot is None:
+        struct_slot = next((s for s in heap.slots
+                            if s.bin == "tcache_perthread_struct"), None)
+    return _version_hint(struct_slot, lists.safe), arena_top, threads
+
+
+def _thread_arenas(reader: _PagedReader, ctx: DetectContext, opts: ParseOptions,
+                   heap: _Heap, walk: _Walk, geo: _Geometry, lists: _Lists,
+                   arena_top: Optional[int]) -> ArenaDiscovery:
+    """Discover, walk and decode the thread arenas (appended to *walk*/*heap*)."""
+    threads = _walk_thread_arenas(reader, ctx, opts, heap, walk, geo, arena_top)
+    lists.diagnostics.extend(threads.diagnostics)
+    _decode_thread_arenas(reader, heap, walk, geo, lists, threads)
+    return threads
+
+
+def _walk_thread_arenas(reader: _PagedReader, ctx: DetectContext, opts: ParseOptions,
+                        heap: _Heap, walk: _Walk, geo: _Geometry,
+                        arena_top: Optional[int]) -> ArenaDiscovery:
+    """Discover the thread arenas and walk their heaps (appended to *walk*/*heap*)."""
+    threads = discover_thread_arenas(
+        reader, geo, ctx.regions, main_top_slot=arena_top,
+        libc_regions=_libc_data_regions(ctx.regions), selects=opts.selects)
+    segments = [h.segment for arena in threads.arenas for h in arena.heaps]
+    first = len(walk.raws)
+    _walk_segments(reader, segments, geo, _PTMALLOC2, opts.max_chunks, walk)
+    heap.extend([_initial_slot(walk.raws, i, geo, _PTMALLOC2)
+                 for i in range(first, len(walk.raws))], segments)
+    return threads
+
+
+def _decode_thread_arenas(reader: _PagedReader, heap: _Heap, walk: _Walk, geo: _Geometry,
+                          lists: _Lists, threads: ArenaDiscovery) -> None:
+    """Decode each thread arena's tcache and (when its top slot is known) bins."""
+    spans = {span.segment: span for span in walk.spans}
+    for arena in threads.arenas:
+        host = arena.first_heap
+        if host is not None:
+            struct_slot = _mark_tcache_struct_at(_first_slot(heap, spans[host.segment]), geo)
+            if struct_slot is not None:
+                _decode_tcache(reader, heap, struct_slot, geo, lists, arena.arena_id)
+        if arena.top_slot is not None:
+            _decode_arena_at(reader, heap, arena.top_slot, geo, lists, arena.arena_id)
+
+
+def _first_slot(heap: _Heap, span: WalkSpan) -> Optional[_Slot]:
+    """The first chunk walked in *span* (slot ``i`` is walked chunk ``i``)."""
+    return heap.slots[span.first] if span.first < span.stop else None
+
+
+def _arena_evidence(heap: _Heap, walk: _Walk, threads: ArenaDiscovery,
+                    lists: _Lists) -> Tuple[Evidence, ...]:
+    """NON_MAIN_ARENA flag agreement (in-use/cached chunks), with thread arenas only."""
+    if not threads.arenas:
+        return ()
+    evidence, diagnostic = arena_flag_check(
+        (slot.raw.flags, span.segment.arena_id != MAIN_ARENA_ID)
+        for span in walk.spans for slot in heap.slots[span.first:span.stop]
+        if slot.state is not ChunkState.FREE and not slot.extra.get("fencepost"))
+    if diagnostic is not None:
+        lists.diagnostics.append(diagnostic)
+    return () if evidence is None else (evidence,)
 
 
 def _empty_layout(flavor: _Flavor, platform: TargetPlatform) -> HeapLayout:
@@ -787,31 +396,92 @@ def _empty_layout(flavor: _Flavor, platform: TargetPlatform) -> HeapLayout:
         coverage={"regions": [], "bytes_total": 0, "chunk_count": 0})
 
 
+def _main_regions(ctx: DetectContext, flavor: _Flavor, opts: ParseOptions,
+                  reader: _PagedReader, geo: _Geometry) -> List[MappedRegion]:
+    """Target regions, minus (ptmalloc2) thread heaps, which are walked as such."""
+    regions = _target_regions(ctx, flavor, opts)
+    if flavor.dlmalloc:
+        return regions
+    return [r for r in regions if not is_thread_heap_region(reader, r, geo.ptr)
+            and not starts_with_mmapped_chunk(reader, r)]
+
+
+def _mmapped(reader: _PagedReader, ctx: DetectContext, opts: ParseOptions,
+             regions: Sequence[MappedRegion], walk: _Walk,
+             threads: ArenaDiscovery) -> MmapScan:
+    """Mmapped chunks outside every walked heap, within what max_chunks has left."""
+    budget = ChunkBudget(max(0, opts.max_chunks - len(walk.raws)))
+    scan = scan_mmapped_chunks(
+        reader, ctx.regions, arena_id=MAIN_ARENA_ID + 1 + len(threads.arenas),
+        budget=budget, claimed=claimed_ranges(regions, threads, reader.geo.ptr),
+        selects=opts.selects)
+    if budget.truncated and not walk.truncated:
+        walk.truncated = True
+        walk.diagnostics.append(truncation_diagnostic(opts.max_chunks))
+    return scan
+
+
 def _parse(memory: VaMemory, ctx: DetectContext, opts: ParseOptions,
            flavor: _Flavor) -> HeapLayout:
-    regions = _target_regions(ctx, flavor, opts)
-    if not regions:
-        return _empty_layout(flavor, memory.platform)
     geo = _geometry(memory.platform)
     reader = _PagedReader(memory, geo)
+    regions = _main_regions(ctx, flavor, opts, reader, geo)
+    if not regions and flavor.dlmalloc:
+        return _empty_layout(flavor, memory.platform)
     walk = _walk_all(reader, regions, geo, flavor, opts.max_chunks)
     heap = _Heap([_initial_slot(walk.raws, i, geo, flavor) for i in range(len(walk.raws))],
                  regions)
     lists = _Lists()
-    version, arena_top = "dlmalloc 2.8.x", None
+    version, arena_top, threads = "dlmalloc 2.8.x", None, ArenaDiscovery()
+    mmapped = MmapScan(0)
     if not flavor.dlmalloc:
-        version, arena_top = _ptmalloc2_overlays(memory, reader, ctx, heap, geo, lists)
-    coverage = _coverage(regions, walk, arena_top, lists.safe)
-    confidence = coverage["bytes_walked"] / max(1, coverage["bytes_total"])
-    return HeapLayout(
-        flavor.kind, version_hint=version, platform=memory.platform,
-        regions=tuple(HeapRegion(r.va, r.size, r.name, "heap") for r in regions),
-        chunks=tuple(_to_chunk(reader, slot, geo) for slot in heap.slots),
-        free_lists=tuple(lists.free_lists),
-        evidence=(Evidence("walk", f"{len(walk.raws)} chunks walked in "
-                           f"{len(regions)} region(s)", confidence),),
-        confidence=confidence,
-        diagnostics=tuple(walk.diagnostics + lists.diagnostics), coverage=coverage)
+        version, arena_top, threads = _ptmalloc2_overlays(memory, reader, ctx, opts, heap,
+                                                          walk, geo, lists)
+        if not regions and not threads.arenas:
+            # Mmapped-looking pages alone are no evidence of ptmalloc2.
+            return _empty_layout(flavor, memory.platform)
+        mmapped = _mmapped(reader, ctx, opts, regions, walk, threads)
+    if not walk.spans and not mmapped.runs:
+        return _empty_layout(flavor, memory.platform)
+    evidence = _arena_evidence(heap, walk, threads, lists) + mmapped.evidence()
+    return assemble_layout(
+        flavor.kind, memory.platform,
+        _arenas(reader, heap, walk, geo, arena_top, threads) + mmapped.arenas(),
+        walk.spans + mmapped.spans(len(heap.slots)),
+        _walked_chunks(reader, heap, walk, geo) + mmapped.chunks,
+        free_lists=lists.free_lists, diagnostics=walk.diagnostics + lists.diagnostics,
+        version_hint=version,
+        walk_summary=f"{len(walk.raws)} chunks walked in {len(walk.spans)} region(s)",
+        truncated_at=opts.max_chunks if walk.truncated else None,
+        extra_coverage=_coverage(arena_top, lists.safe, threads, mmapped),
+        evidence=evidence)
+
+
+def _arenas(reader: _PagedReader, heap: _Heap, walk: _Walk, geo: _Geometry,
+            arena_top: Optional[int], threads: ArenaDiscovery) -> List[HeapArena]:
+    """Arena 0 followed by every thread arena (each with its walked top chunk)."""
+    va = (None if arena_top is None or threads.top_off is None
+          else arena_top - threads.top_off)
+    return [_main_arena(heap, walk, arena_top, va)] + [
+        thread_heap_arena(reader, t, geo.ptr, _walked_top(heap, walk, t.arena_id),
+                          threads.method)
+        for t in threads.arenas]
+
+
+def _arena_spans(walk: _Walk, arena_id: int) -> List[WalkSpan]:
+    return [span for span in walk.spans if span.segment.arena_id == arena_id]
+
+
+def _walked_top(heap: _Heap, walk: _Walk, arena_id: int) -> Optional[int]:
+    top = heap.top_of(_arena_spans(walk, arena_id))
+    return None if top is None else top.raw.va
+
+
+def _main_arena(heap: _Heap, walk: _Walk, arena_top: Optional[int],
+                va: Optional[int] = None) -> HeapArena:
+    """Arena 0 (glibc ``main_arena`` / dlmalloc's global ``malloc_state``)."""
+    return main_arena(_arena_spans(walk, MAIN_ARENA_ID), arena_top,
+                      _walked_top(heap, walk, MAIN_ARENA_ID), va)
 
 
 def parse_ptmalloc2(memory: VaMemory, ctx: DetectContext,

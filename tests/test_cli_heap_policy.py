@@ -21,6 +21,7 @@ from memdiver.cli._shared import (
     ALLOCATOR_CHOICES,
     HEAP_POLICY_CHOICES,
     PIPELINE_ALLOCATOR_CHOICES,
+    SEARCH_REDUCE_ALLOCATOR_CHOICES,
 )
 from memdiver.cli.consensus import (
     _cmd_consensus,
@@ -87,6 +88,24 @@ def test_choice_tuples_match_the_engine():
     assert PIPELINE_ALLOCATOR_CHOICES == ALLOCATOR_CHOICES + ("off",)
     for name in ALLOCATOR_CHOICES:
         parse_allocator_hint(name)   # every CLI choice is a valid hint
+
+
+def test_search_reduce_allocator_choices_match_reduce_ready_kinds():
+    from memdiver.app._pipeline_heap import reduce_ready_allocators
+
+    concrete = tuple(c for c in SEARCH_REDUCE_ALLOCATOR_CHOICES
+                     if c not in ("auto", "off"))
+    assert concrete == reduce_ready_allocators()
+    assert set(SEARCH_REDUCE_ALLOCATOR_CHOICES) <= set(PIPELINE_ALLOCATOR_CHOICES)
+
+
+def test_consensus_begin_allocator_choices(capsys):
+    base = ["consensus-begin", "--state", "s.json", "--size", "16"]
+    assert _parse(base).allocator == "auto"
+    assert _parse([*base, "--allocator", "off"]).allocator == "off"
+    with pytest.raises(SystemExit):
+        _parse([*base, "--allocator", "scudo"])
+    capsys.readouterr()
 
 
 @pytest.mark.parametrize("command", [
@@ -191,6 +210,20 @@ def test_candidate_lines_mark_residual_chunks():
     assert "chunk=0x20+0x20" in line and line.endswith("state=cached residual")
 
 
+def test_candidate_lines_show_arena_only_when_known():
+    chunk = {"start": 0x20, "size": 64, "state": "in_use",
+             "offset_in_chunk": 0x20, "agree": 4}
+    regions = [
+        {"rank": 1, "offset": 0x40, "length": 32,
+         "heap": {"chunk": {**chunk, "arena": "thread"}, "residual": False}},
+        {"rank": 2, "offset": 0x40, "length": 32,
+         "heap": {"chunk": chunk, "residual": False}},
+    ]
+    known, unknown = candidate_heap_lines(regions)
+    assert known.endswith("state=in_use arena=thread")
+    assert "arena=" not in unknown
+
+
 def test_locate_key_lines_mark_freed_hits_only():
     rows = [{"dump_path": "d0", "offsets": [0x10, 0x20, 0x30], "heap": [
         {"allocator": "ptmalloc2", "chunk_va": 0x1000, "chunk_size": 64,
@@ -239,6 +272,10 @@ def test_heap_policy_mask_changes_heap_masked_end_to_end(corpus, tmp_path,
             "--heap-policy", policy, "-o", str(out)])
         assert code in (0, None)
         assert "heap status=ok" in streams.err
+        status_lines = [ln for ln in streams.err.splitlines() if "heap status=" in ln]
+        assert len(status_lines) == 1
+        assert status_lines[0].startswith("memdiver: heap status=ok residual=")
+        assert "allocator=" not in status_lines[0]   # unchanged format
         outputs[policy] = json.loads(out.read_text())
     assert "heap_masked" not in outputs["annotate"]["stages"]
     assert outputs["mask"]["stages"]["heap_masked"] > 0
@@ -281,3 +318,29 @@ def test_locate_key_prints_chunk_lines(corpus, tmp_path, monkeypatch, capsys):
         "-o", str(out)])
     assert "chunk=0x" not in streams.err
     assert all("heap" not in r for r in json.loads(out.read_text())["dumps"])
+
+
+# -- mask precondition wording (review fixes) -----------------------------------------
+
+
+def test_batch_mask_error_does_not_claim_a_reduce_ready_requirement(tmp_path):
+    from memdiver.app._pipeline_heap import heap_inputs_from_consensus, load_heap_beside
+    from memdiver.core.service_errors import CapabilityError
+
+    with pytest.raises(CapabilityError) as by_consensus:
+        heap_inputs_from_consensus(argparse.Namespace(heap=None), "mask")
+    with pytest.raises(CapabilityError) as beside:
+        load_heap_beside(str(tmp_path / "variance.npy"), "mask")
+    for exc in (by_consensus, beside):
+        assert "reduce-ready" not in str(exc.value)
+        assert "VA map" in str(exc.value)
+
+
+def test_search_reduce_mask_error_names_the_reduce_ready_allocators():
+    from memdiver.app._pipeline_heap import reduce_ready_allocators, require_heap_for_mask
+    from memdiver.core.service_errors import CapabilityError
+
+    with pytest.raises(CapabilityError) as exc:
+        require_heap_for_mask(None, "mask")
+    assert "reduce-ready" in str(exc.value)
+    assert all(name in str(exc.value) for name in reduce_ready_allocators())

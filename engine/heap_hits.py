@@ -46,7 +46,7 @@ def _hit_heap(layout: Any, memory: Any, offset: int, view: str) -> HitHeap:
     chunk = layout.chunk_at(va) if va is not None else None
     if chunk is None:
         return None
-    return {
+    hit: Dict[str, Any] = {
         "allocator": layout.allocator.value,
         "chunk_va": int(chunk.va),
         "chunk_size": int(chunk.size),
@@ -54,6 +54,16 @@ def _hit_heap(layout: Any, memory: Any, offset: int, view: str) -> HitHeap:
         "offset_in_chunk": int(va - chunk.va),
         "role": _role_name(layout, va),
     }
+    return {**hit, **_arena_entry(layout, chunk)}
+
+
+def _arena_entry(layout: Any, chunk: Any) -> Dict[str, str]:
+    """``{"arena": kind}`` when the chunk's arena is known, else ``{}``."""
+    from memdiver.heap.model import arena_entry
+
+    arena_kind = getattr(layout, "arena_kind", None)
+    arena_id = getattr(chunk, "arena_id", None)
+    return arena_entry(arena_kind(arena_id) if arena_kind is not None else None)
 
 
 def heap_hit_annotations(source: Any, offsets: Sequence[int],

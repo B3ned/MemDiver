@@ -249,13 +249,18 @@ def _vas_name(vas: List[Tuple[int, int, str]], va: int, end: int) -> str:
     return best
 
 
+def _module_path_of(name: str) -> Optional[str]:
+    """*name* when it is a file path (starts with ``/``), else ``None``."""
+    return name if name.startswith("/") else None
+
+
 def _msl_mapped_region(info: Any, vas: List[Tuple[int, int, str]]
                        ) -> MappedRegion:
     prot = int(info.protection)
     va, size = int(info.base_addr), int(info.size)
     vas_name = "" if info.name else _vas_name(vas, va, va + max(size, 1))
-    module_path = info.module_path or (
-        vas_name if vas_name.startswith("/") else None)
+    named_path = info.name or vas_name  # a non-imported .msl names the file here
+    module_path = info.module_path or _module_path_of(named_path)
     return MappedRegion(
         va=va, size=size,
         perms=_perms_string(bool(prot & 0x01), bool(prot & 0x02),
@@ -272,7 +277,7 @@ def _regioned_map(source: Any) -> Optional[List[MappedRegion]]:
     usable = source._usable_region_count  # noqa: SLF001
     return [
         MappedRegion(va=r.start, size=r.size, perms=r.perm[:3], name=r.path,
-                     module_path=r.path if r.path.startswith("/") else None,
+                     module_path=_module_path_of(r.path),
                      captured=idx < usable)
         for idx, r in enumerate(regions)
     ]

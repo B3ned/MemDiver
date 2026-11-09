@@ -208,3 +208,40 @@ def test_to_dict_is_json_safe_and_limited():
 def test_to_dict_roles_serialized_as_ints():
     chunk = _chunk(BASE, 0x20, roles=((0x10, 8, HeapRole.FREE_LINK),))
     assert _layout(chunk).to_dict()["chunks"][0]["roles"] == [[0x10, 8, 3]]
+
+
+# -- arenas -------------------------------------------------------------------
+
+
+def test_heap_arena_to_dict_is_json_safe():
+    from memdiver.heap.model import ARENA_MAIN, HeapArena
+    arena = HeapArena(0, ARENA_MAIN, va=0x7000, top_va=BASE + 0x100,
+                      region_vas=(BASE,), extra={"kind": AllocatorKind.SCUDO})
+    data = arena.to_dict()
+    json.dumps(data)
+    assert data == {"arena_id": 0, "kind": "main", "va": 0x7000,
+                    "top_va": BASE + 0x100, "region_vas": [BASE],
+                    "extra": {"kind": "scudo"}}
+
+
+def test_layout_to_dict_carries_arenas_and_arena_ids():
+    from memdiver.heap.model import ARENA_THREAD, REGION_THREAD_HEAP, HeapArena
+    layout = HeapLayout(
+        allocator=AllocatorKind.PTMALLOC2,
+        regions=(HeapRegion(BASE, 0x1000, "t", REGION_THREAD_HEAP, 1),),
+        chunks=(_chunk(BASE, 0x20, arena_id=1), _chunk(BASE + 0x20, 0x20)),
+        arenas=(HeapArena(1, ARENA_THREAD),))
+    data = layout.to_dict()
+    json.dumps(data)
+    assert [a["arena_id"] for a in data["arenas"]] == [1]
+    assert data["regions"][0]["arena_id"] == 1
+    assert data["chunks"][0]["arena_id"] == 1
+    assert "arena_id" not in data["chunks"][1]
+
+
+def test_unset_arena_id_keeps_legacy_dict_shape():
+    region = HeapRegion(BASE, 0x1000, "[heap]", "heap")
+    assert region.to_dict() == {"va": BASE, "size": 0x1000,
+                                "name": "[heap]", "kind": "heap"}
+    assert "arena_id" not in _chunk(BASE, 0x20).to_dict()
+    assert _layout().to_dict()["arenas"] == []

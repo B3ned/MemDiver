@@ -9,7 +9,8 @@ callers knowing which allocator produced the heap. For the researcher view, see
 
 | Module | Responsibility |
 |---|---|
-| `heap/model.py` | Plain data types: `AllocatorKind`, `ChunkState`, `HeapRole` (stable `IntEnum` values), `HeapChunk`, `HeapRegion`, `FreeList`, `Evidence`, `HeapLayout` (`chunk_at`, `role_runs`, `role_counts`, `to_dict`) |
+| `heap/model.py` | Plain data types: `AllocatorKind`, `ChunkState`, `HeapRole` (stable `IntEnum` values), `HeapChunk`, `HeapRegion`, `FreeList`, `Evidence`, `HeapArena`, `HeapLayout` (`chunk_at`, `role_runs`, `role_counts`, `to_dict`, `arenas`); arena kinds `ARENA_MAIN` / `ARENA_THREAD` / `ARENA_MMAP` and shared region kinds `REGION_MAIN_HEAP` / `REGION_THREAD_HEAP` / `REGION_MMAPPED_CHUNK`. Chunks, regions and free lists carry an optional `arena_id`. |
+| `heap/segments.py` | The shared parser shape: `HeapSegment` (one contiguous range of an arena, walked from `walk_start`), `ChunkBudget` (`max_chunks` across all segments), `LayoutAssembler` (stamps `arena_id`, accumulates the standard coverage keys, builds the `HeapLayout`), the shared truncation diagnostic |
 | `heap/platform.py` | `TargetPlatform` (os, arch, pointer size, endianness, *how we know*) and `memory_map_of` → `MappedRegion` list, read from the MSL header and region blocks, the ELF core `e_machine` + NT_FILE, or `.maps` names. Falls back to `ASSUMED_PLATFORM` (x86_64 LE) and never raises. |
 | `heap/memory.py` | `VaMemory`: reads by virtual address over any source; `strip_tag` (arm64 TBI) |
 | `heap/registry.py` | `AllocatorDescriptor`, `DetectContext`, `DetectScore`, `ParseOptions`, `register_allocator`, `run_detector`, and the `memdiver.allocators` entry-point group |
@@ -17,6 +18,11 @@ callers knowing which allocator produced the heap. For the researcher view, see
 | `heap/builtin.py` | The built-in descriptors (`BUILTIN_SPECS`): priority, levels, `partial` / `heuristic`; `name_detector` combines name signals with each parser's content probe |
 | `heap/analyze.py` | `analyze_heap`, the single facade: detect, parse, fall back, annotate, cache |
 | `heap/allocators/{ptmalloc2,scudo,mallocng,jemalloc,generic}.py` | One parser module per allocator family. Each exports `DESCRIPTOR_OVERRIDES = {kind: (probe, parse)}`. |
+| `heap/allocators/ptmalloc2_walk.py` | ptmalloc2 / dlmalloc boundary-tag walker: geometry and flavours, paged reads, the chunk-header walk with resync and fencepost detection, and the per-chunk slot model |
+| `heap/allocators/ptmalloc2_bins.py` | ptmalloc2 free-list decoding: tcache (plain / safe-linked), fastbins, unsorted / small / large bins, and locating `main_arena` in glibc's writable data |
+| `heap/allocators/ptmalloc2_segments.py` | ptmalloc2 / dlmalloc segment bookkeeping: `WalkSpan`, glibc fencepost detection, the main arena (arena 0) and its `heap` segments, `assemble_layout` |
+| `heap/allocators/ptmalloc2_arenas.py` | ptmalloc2 thread-arena discovery: the `main_arena.next` ring, or a `heap_info` scan of `HEAP_MAX_SIZE`-aligned anonymous maps; yields arenas 1..n with their `thread_heap` segments |
+| `heap/allocators/ptmalloc2_mmapped.py` | ptmalloc2 mmapped-chunk scan: page-granular search of captured, writable, anonymous, non-heap / non-stack regions for `{prev_size, size \| IS_MMAPPED}` headers; hits become in-use `mmapped_chunk` segments of a pseudo arena of kind `mmap` |
 
 Consumers outside the package:
 
@@ -81,6 +87,7 @@ class AllocatorDescriptor:
     levels: FrozenSet[str] = frozenset({"L0"})
     partial: bool = False
     heuristic: bool = False
+    reduce_ready: bool = False
 ```
 
 - The registry is keyed by `AllocatorKind`. Registering a kind that is already
@@ -98,6 +105,19 @@ class AllocatorDescriptor:
   `no parser registered` and moves on.
 - `partial` / `heuristic` / `levels` are surfaced verbatim in every summary
   payload and in the UI badges.
+- `reduce_ready` opts an allocator in to heap-aware candidate reduction
+  (`search-reduce`, `consensus-begin --allocator`). It defaults to `False`;
+  `reduce_ready_kinds()` lists the opted-in kinds in priority order (today:
+  `ptmalloc2`). `cli/_shared.SEARCH_REDUCE_ALLOCATOR_CHOICES` must name the
+  same set, which `tests/test_cli_heap_policy.py` checks.
+- A parser returns one `HeapLayout`. Besides chunks, regions and free lists it
+  may fill `HeapLayout.arenas` (a tuple of `HeapArena`: `arena_id`, `kind`,
+  `va` of the control structure, `top_va` = address of the arena's `top`
+  field, not the top chunk, `region_vas`, `extra`), and tag chunks, regions and
+  free lists with the owning `arena_id`. Parsers built on
+  `heap/segments.LayoutAssembler` get this, and the standard coverage keys
+  (`regions`, `arenas`, `bytes_total`, `bytes_walked`, `bytes_skipped`,
+  `bytes_uncaptured`, `chunk_count`, `truncated`), for free.
 
 See [Adding an allocator](../contributing/adding_allocator.md) for a worked
 plugin.

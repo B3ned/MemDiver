@@ -33,7 +33,7 @@ allocator, **L2** chunk walk, **L3** free-list walk.
 
 | Allocator | Typical platforms | Detection signals | Levels | What is decoded | Flags |
 |---|---|---|---|---|---|
-| `ptmalloc2` | glibc Linux (x86_64, arm64, 32-bit) | glibc mapped (`libc.so.6`, `libc-2.*.so`), a `[heap]` region on a non-Android target, content probe | L0–L3 | Boundary-tag chunk walk of `[heap]` (flags `PREV_INUSE` / `IS_MMAPPED` / `NON_MAIN_ARENA`), `tcache_perthread_struct` (size `0x290` means glibc ≥ 2.30, `0x250` means 2.26–2.29), tcache bins with and without safe-linking (glibc ≥ 2.32), `main_arena` located in glibc's writable mapping, then fastbins and the unsorted / small / large bins | — |
+| `ptmalloc2` | glibc Linux (x86_64, arm64, 32-bit) | glibc mapped (`libc.so.6`, `libc-2.*.so`), a `[heap]` region on a non-Android target, content probe | L0–L3 | Boundary-tag chunk walk of `[heap]` (flags `PREV_INUSE` / `IS_MMAPPED` / `NON_MAIN_ARENA`), `tcache_perthread_struct` (size `0x290` means glibc ≥ 2.30, `0x250` means 2.26–2.29), tcache bins with and without safe-linking (glibc ≥ 2.32), `main_arena` located in glibc's writable mapping, then fastbins and the unsorted / small / large bins. Thread arenas (via the `main_arena.next` ring, or a `heap_info` scan of `HEAP_MAX_SIZE`-aligned anonymous maps) walked as `thread_heap` regions of arenas 1..n. mmapped chunks found by a page-granular header scan (pseudo arena of kind `mmap`). | — |
 | `dlmalloc` | embedded heaps, older bionic (`[anon:libc_malloc]`) | content probe only (dlmalloc has no naming convention) | L0–L2 | Same boundary-tag walker; bit 2 is `CINUSE`. Free chunks are labelled `smallbin` / `treebin` by size. | — |
 | `scudo` | Android ≥ 11, LLVM standalone scudo | `[anon:scudo:*]` regions, `libscudo*` mapped, Android OS prior, content probe | L0–L2 | Primary-region chunks. The packed 64-bit header (`ClassId`, `State`, size, `Offset`, checksum) is judged on **structure** because the checksum cookie is per-process. Stride and slot phase are inferred from the bytes. | **partial** |
 | `mallocng` | musl ≥ 1.2.1 (Alpine and static musl builds) | musl loader / libc mapped (`ld-musl-*.so.1`, `libc.musl-*`) | L0–L2 | Groups found through the `meta->mem == group` back-pointer check, slot state from `avail_mask` / `freed_mask`, in-band slot headers decoded to recover the requested size | — |
@@ -50,13 +50,29 @@ payload (`partial`, `heuristic`, `levels`). The web UI shows them as badges.
 These come from the parser modules (`heap/allocators/*.py`). Each one produces
 a diagnostic instead of a guess.
 
-- **ptmalloc2.** Only the regions named like the main heap (`[heap]`; for
-  dlmalloc also `[anon:libc_malloc]`) are walked unless you select others.
-  Non-main arenas (`heap_info` at 64 MiB-aligned anonymous maps) are not
-  decoded, mmapped chunks are not enumerated, and `main_arena` is not found in
-  statically linked binaries. An i386 glibc built with `MALLOC_ALIGNMENT == 16`
-  is not handled. Corrupt headers are skipped by resyncing to the next
-  plausible header, and the diagnostic names the address.
+- **ptmalloc2.** The main heap is the region named `[heap]` (for dlmalloc
+  also `[anon:libc_malloc]`), walked as arena 0.
+  - *Thread arenas* are found through the `main_arena.next` ring or, when
+    `main_arena` is not available, by scanning `HEAP_MAX_SIZE`-aligned
+    (64 MiB on 64-bit, 1 MiB on 32-bit) anonymous writable maps for a valid
+    `heap_info`. Each of their heaps is walked as a `thread_heap` region of
+    arena 1..n, and the arena's tcache is decoded. Coverage reports
+    `thread_arenas` and `arena_discovery` (`ring` or `heap_info_scan`).
+  - *mmapped chunks* (ptmalloc2 only) are found by a page-granular scan of
+    captured, writable, anonymous regions that are neither the heap nor a
+    stack, looking for a `{prev_size = correction, size | IS_MMAPPED}` header.
+    Each hit is an in-use chunk with bin `mmapped` in a pseudo arena of kind
+    `mmap`, recorded as a region of kind `mmapped_chunk`. With an explicit
+    `--regions`, only the selected regions are scanned (and only selected
+    thread heaps are walked). Coverage reports the count as `mmapped_chunks`.
+  - Remaining limitations: `main_arena` is not found in statically linked
+    binaries, so thread arenas then come from the `heap_info` scan and their
+    bins (fastbins, unsorted / small / large) are not decoded. The offset of
+    `top` inside `malloc_state` is learnt once from the arena ring and assumed
+    to be the same for every arena. dlmalloc mmapped chunks are not
+    enumerated. An i386 glibc built with `MALLOC_ALIGNMENT == 16` is not
+    handled. Corrupt headers are skipped by resyncing to the next plausible
+    header, and the diagnostic names the address.
 - **scudo.** `[anon:scudo:secondary]` mappings are listed but their
   `LargeBlock::Header` is not decoded. BatchClass blocks (ClassId 0) and the
   per-class `TransferBatch` free lists are not walked, so no free lists are
@@ -255,16 +271,65 @@ memdiver analyze-candidates snapshots/*.msl --heap-policy mask -o candidates.jso
 ```
 
 `--heap-policy` (CLI), `heap_policy` (web candidates request, MCP
-`analyze_candidates` / `search_reduce`) select the policy. `search-reduce`
-over a saved `--state` session carries no heap roles: `annotate` adds
-nothing there and `mask` is refused. Use `analyze-candidates`, or a pipeline
-run whose consensus stage wrote `heap_roles.npz`.
+`analyze_candidates` / `search_reduce`) select the policy. For
+`search-reduce` over a saved `--state` session, see
+[Allocator-aware search-reduce](#allocator-aware-search-reduce).
 
 **`residual: true`** means the region starts in a freed chunk (`free`, `cached`
 or `quarantined`). A high-entropy residual is often a real key that the program
 freed without wiping, so it is evidence about the key's lifecycle, not live
 state. Masking does not remove residuals. Only allocator-owned bytes are
 masked.
+
+### Allocator-aware search-reduce
+
+`search-reduce` reduces the variance of an incremental (Welford) session
+(`consensus-begin` / `consensus-add`). It takes `--allocator {auto,ptmalloc2,off}`
+(default `auto`) next to `--heap-policy`. Only ptmalloc2 (glibc) heap roles feed
+the reduction; another detected allocator reports `unsupported_allocator`.
+
+The heap roles come from one of two sources:
+
+- **session** (preferred): `consensus-begin --allocator auto|ptmalloc2` makes
+  every `consensus-add` project that dump's heap onto the session slab and store
+  it as `<state stem>.heap/<index>.npz`. `search-reduce` merges the stored
+  projections the same way the batch consensus does, so `agree` counts the
+  dumps (out of N) that give a byte the same role. Re-running `consensus-begin`
+  on the same `--state` removes the old `NNNN.npz` projections (four or more
+  digits).
+- **reference** (fallback): a session without projections (begun before heap
+  support or with `--allocator off`) falls back to the `--reference-dump`
+  alone. Every `agree` is then 1, and the report names the reason
+  (`fallback_reason`).
+
+stderr names the source and then prints a single status line, for example
+`memdiver: heap source=session (dumps_recorded=4, dumps_folded=4)` and
+`memdiver: heap status=ok allocator=ptmalloc2 chunks=8 runs=17 residual=0/2`
+(plus `heap_masked=N` under `--heap-policy mask`). If some recorded
+projection files are missing, the merge runs over the rest; the report lists
+them in `missing_projections` and stderr adds a warning.
+
+| `--allocator` | `annotate` (default) | `mask` | `off` |
+|---|---|---|---|
+| `auto` / `ptmalloc2`, heap `ok` | regions get `heap` blocks; payload gains `heap`, `heap_status`, `thresholds.allocator` | metadata bytes removed (`stages.heap_masked`) | historical payload |
+| `auto` / `ptmalloc2`, heap unavailable (raw dumps, other allocator, error) | stderr warning, regions unannotated, `heap.status` says why | precondition error naming the status, exit 2 | historical payload |
+| `off` | historical payload (no `heap` key) | argument error, exit 2 | historical payload |
+
+The payload's `heap` block holds the status, the merge report (`allocator`,
+`coordinate`, `source`, `dumps_recorded`, `dumps_folded`, `chunk_count`,
+`role_counts`, `min_agree`, `fallback_reason` when it applies) and `per_dump`
+records. It never embeds the run or chunk arrays. `thresholds.allocator` is
+the requested value (`auto` stays `auto`), and `heap.allocator` is the
+resolved one.
+
+```bash
+memdiver consensus-begin --state s.json --size 4096 --allocator auto
+for d in snapshots/*.msl; do memdiver consensus-add --state s.json "$d"; done
+memdiver search-reduce --state s.json --reference-dump snapshots/run1.msl \
+    --allocator auto -o candidates.json
+memdiver search-reduce --state s.json --reference-dump snapshots/run1.msl \
+    --heap-policy mask -o masked.json
+```
 
 ### Located-key hits
 

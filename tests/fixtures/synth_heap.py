@@ -23,8 +23,9 @@ from __future__ import annotations
 import random
 import struct
 from dataclasses import dataclass, field
+from dataclasses import replace as dataclasses_replace
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from memdiver.heap.model import AllocatorKind, ChunkState
 
@@ -44,6 +45,7 @@ class ExpectedChunk:
     header_len: int
     user_len: int
     bin: Optional[str] = None
+    flags: Optional[int] = None       # size-field flag bits, when the test checks them
 
 
 @dataclass
@@ -64,6 +66,7 @@ class SynthHeap:
     chunks: List[ExpectedChunk]
     tiled_span: Tuple[int, int] = (0, 0)
     perms: List[str] = field(default_factory=list)
+    meta: Dict[str, int] = field(default_factory=dict)   # builder-specific VAs
 
     def region_bytes(self, idx: int) -> bytes:
         start = sum(size for _va, size, _n in self.regions[:idx])
@@ -206,6 +209,299 @@ def _write_tcache(buf: bytearray, bins: dict, tcache_mem: int, base_va: int,
             stored = ((mem >> 12) ^ nxt) if safe_linking else nxt
             _put_word(buf, mem - base_va, stored, pointer_size)
             _put_word(buf, mem - base_va + pointer_size, tcache_mem, pointer_size)
+
+
+# -- glibc arenas: main_arena page + thread (non-main) arenas -----------------------
+
+NON_MAIN_ARENA = 0x4
+NFASTBINS = 10                        # 32- and 64-bit with MALLOC_ALIGNMENT = 2*SIZE_SZ
+NBIN_PAIRS = 127                      # bins[2 * NBINS - 2]
+MAIN_ARENA_OFFSET = 0x100             # &main_arena inside the synthetic libc page
+LIBC_PATHS = {8: "/usr/lib/x86_64-linux-gnu/libc.so.6",
+              4: "/usr/lib/i386-linux-gnu/libc.so.6"}
+#: The 32-byte "key" the thread-arena fixture stores in one in-use chunk.
+THREAD_KEY = bytes(range(0xA0, 0xC0))
+
+
+def _align_up(value: int, align: int) -> int:
+    return (value + align - 1) & ~(align - 1)
+
+
+def heap_max_size(pointer_size: int) -> int:
+    """HEAP_MAX_SIZE = 2 * DEFAULT_MMAP_THRESHOLD_MAX: 64 MiB / 1 MiB."""
+    return (64 << 20) if pointer_size == 8 else (1 << 20)
+
+
+def glibc_top_off(pointer_size: int) -> int:
+    """offsetof(malloc_state, top), glibc >= 2.27 (mutex, flags, have_fastchunks)."""
+    return _align_up(12, pointer_size) + NFASTBINS * pointer_size
+
+
+def heap_info_size(pointer_size: int, *, glibc_235: bool = True) -> int:
+    """sizeof(heap_info): 4 words (+ pagesize since 2.35) padded to MALLOC_ALIGNMENT."""
+    words = 5 if glibc_235 else 4
+    return _align_up(words * pointer_size, _malloc_alignment(pointer_size))
+
+
+def thread_arena_va(base_va: int, pointer_size: int = 8, *,
+                    glibc_235: bool = True) -> int:
+    """&malloc_state of the thread arena whose first heap is at *base_va*."""
+    return base_va + heap_info_size(pointer_size, glibc_235=glibc_235)
+
+
+def _write_malloc_state(buf: bytearray, off: int, base: int, ptr: int, top_off: int,
+                        *, top: int, next_arena: int, system_mem: int = 0,
+                        bins: Optional[Dict[int, Tuple[int, int]]] = None) -> None:
+    """``struct malloc_state`` at ``buf[off:]`` (VA *base*); empty bins self-link.
+
+    *bins* maps a bin header VA (``bin_at(i)``) to its ``(fd, bk)``.
+    """
+    top_slot, slot_off = base + top_off, off + top_off
+    _put_word(buf, slot_off, top, ptr)
+    for pair in range(NBIN_PAIRS):
+        header = top_slot + 2 * pair * ptr
+        fd, bk = (bins or {}).get(header, (header, header))
+        _put_word(buf, slot_off + 2 * ptr + 2 * pair * ptr, fd, ptr)
+        _put_word(buf, slot_off + 3 * ptr + 2 * pair * ptr, bk, ptr)
+    next_off = slot_off + 256 * ptr + 16
+    _put_word(buf, next_off, next_arena, ptr)
+    _put_word(buf, next_off + 2 * ptr, 1, ptr)              # attached_threads
+    _put_word(buf, next_off + 3 * ptr, system_mem, ptr)
+    _put_word(buf, next_off + 4 * ptr, system_mem, ptr)     # max_system_mem
+
+
+def glibc_main_arena_page(top_chunk_va: int, *, pointer_size: int = 8,
+                          libc_va: Optional[int] = None,
+                          next_arena: Optional[int] = None) -> SynthHeap:
+    """A writable glibc data page holding ``main_arena`` at +0x100.
+
+    Mirrors the ``_arena_fixture`` layout of ``tests/test_heap_ptmalloc2.py``
+    (``&main_arena.top`` = page + 0x100 + ``glibc_top_off``) with every bin
+    empty. ``main_arena.next`` is *next_arena* (default: ``&main_arena``,
+    i.e. a process without thread arenas). ``meta``: ``arena_va``,
+    ``top_slot_va``, ``next_slot_va``.
+    """
+    ptr = pointer_size
+    if libc_va is None:
+        libc_va = 0x7FFF_F7E0_0000 if ptr == 8 else 0xF7D0_0000
+    arena = libc_va + MAIN_ARENA_OFFSET
+    top_off = glibc_top_off(ptr)
+    page = bytearray(PAGE)
+    _write_malloc_state(page, MAIN_ARENA_OFFSET, arena, ptr, top_off, top=top_chunk_va,
+                        next_arena=arena if next_arena is None else next_arena)
+    meta = {"arena_va": arena, "top_slot_va": arena + top_off,
+            "next_slot_va": arena + top_off + 256 * ptr + 16}
+    return SynthHeap(bytes(page), libc_va, "libc", ptr,
+                     [(libc_va, PAGE, LIBC_PATHS[ptr])], [], perms=["rw-p"], meta=meta)
+
+
+def glibc_thread_arena(base_va: Optional[int] = None, *, pointer_size: int = 8,
+                       safe_linking: bool = True, heap_size: int = 2 * PAGE,
+                       top_off: Optional[int] = None, include_tcache: bool = True,
+                       extra_heap: bool = False, free_old_top: bool = False,
+                       next_arena: int = 0, glibc_235: bool = True) -> SynthHeap:
+    """A glibc thread (non-main) arena: its first heap, plus optionally a second.
+
+    Follows ``malloc/arena.c``: the heap mmap is ``HEAP_MAX_SIZE``-aligned and
+    starts with ``heap_info { ar_ptr, prev, size, mprotect_size [, pagesize]
+    }``; ``malloc_state`` follows it (``ar_ptr``), chunks start after it
+    (realigned). Every chunk the arena handed out has NON_MAIN_ARENA |
+    PREV_INUSE; the top chunk only PREV_INUSE. Chunks: the thread's
+    ``tcache_perthread_struct`` (when *include_tcache*), in-use chunks (one
+    holding :data:`THREAD_KEY`), one tcache'd chunk, one free smallbin chunk
+    (linked from ``bins``), then the top chunk -- or, with *extra_heap*, a
+    filler and a fencepost, the top living in a second heap at
+    ``base_va + HEAP_MAX_SIZE`` whose ``heap_info.prev`` is the first.
+    With *free_old_top* (needs *extra_heap*) the filler is the old top as
+    ``sysmalloc`` leaves it after ``_int_free``: in the unsorted bin, its
+    size in the fencepost's ``prev_size`` and the fencepost's PREV_INUSE
+    cleared. ``main_arena``-style ``next`` is *next_arena*.
+    """
+    ptr, hdr = pointer_size, 2 * pointer_size
+    if base_va is None:
+        base_va = 0x7FFF_E400_0000 if ptr == 8 else 0xB7A0_0000
+    top_off = glibc_top_off(ptr) if top_off is None else top_off
+    arena = thread_arena_va(base_va, ptr, glibc_235=glibc_235)
+    first_va = _align_up(arena + top_off + 256 * ptr + 16 + 5 * ptr, hdr)
+    buf = bytearray(heap_size)
+    _write_heap_info(buf, arena, 0, heap_size, ptr, glibc_235)
+    chunks, meta, bins, off = _thread_chunks(buf, base_va, first_va, ptr, arena + top_off,
+                                             include_tcache, safe_linking)
+    regions: List[Region] = [(base_va, heap_size, "")]
+    second = bytearray()
+    if extra_heap:
+        old_top_bin = (arena + top_off, bins) if free_old_top else None
+        top_va, second = _fence_and_second_heap(buf, base_va, off, chunks, arena, ptr,
+                                                glibc_235, old_top_bin)
+        regions.append((base_va + heap_max_size(ptr), PAGE, ""))
+        meta["second_heap_va"] = base_va + heap_max_size(ptr)
+    else:
+        top_va = base_va + off
+        _write_boundary_chunk(buf, off, (heap_size - off) | PREV_INUSE, ptr)
+        chunks.append(ExpectedChunk(top_va, heap_size - off, ChunkState.FREE, hdr,
+                                    heap_size - off - hdr, "top", PREV_INUSE))
+    system_mem = heap_size + (PAGE if extra_heap else 0)
+    _write_malloc_state(buf, arena - base_va, arena, ptr, top_off, top=top_va,
+                        next_arena=next_arena, system_mem=system_mem, bins=bins)
+    meta.update(arena_va=arena, top_slot_va=arena + top_off, top_chunk_va=top_va,
+                top_off=top_off, heap_info_size=arena - base_va, first_chunk_va=first_va)
+    return SynthHeap(bytes(buf + second), base_va, AllocatorKind.PTMALLOC2.value, ptr, regions,
+                     chunks, (first_va, base_va + heap_size), ["rw-p"] * len(regions),
+                     meta)
+
+
+def _write_heap_info(buf: bytearray, ar_ptr: int, prev: int, size: int, ptr: int,
+                     glibc_235: bool) -> None:
+    for idx, word in enumerate((ar_ptr, prev, size, size)):
+        _put_word(buf, idx * ptr, word, ptr)
+    if glibc_235:
+        _put_word(buf, 4 * ptr, PAGE, ptr)                    # pagesize
+
+
+def _thread_chunks(buf: bytearray, base_va: int, first_va: int, ptr: int,
+                   top_slot: int, include_tcache: bool, safe_linking: bool):
+    """Tcache struct + the fixed chunk mix; returns (chunks, meta, bins, end offset)."""
+    hdr, used = 2 * ptr, PREV_INUSE | NON_MAIN_ARENA
+    chunks: List[ExpectedChunk] = []
+    meta: Dict[str, int] = {}
+    off = first_va - base_va
+    if include_tcache:
+        size = _tcache_struct_size(ptr)
+        _write_boundary_chunk(buf, off, size | used, ptr)
+        chunks.append(ExpectedChunk(first_va, size, ChunkState.IN_USE, hdr, size - hdr,
+                                    "tcache_perthread_struct", used))
+        off += size
+    layout = [(0x30, "use", 0x61), (0x50, "key", 0x62), (0x30, "cached", 0x63),
+              (0x50, "use", 0x64), (0x90, "small", 0x65), (0x30, "after", 0x66)]
+    tcache: Dict[int, List[int]] = {}
+    bins: Dict[int, Tuple[int, int]] = {}
+    prev_size = 0
+    for size, (_s, role, fill) in zip(_scaled([s for s, _r, _f in layout], ptr), layout):
+        va, flags = base_va + off, used
+        _fill(buf, off + hdr, size - hdr, fill)
+        state, label = ChunkState.IN_USE, None
+        if role == "key":
+            buf[off + hdr:off + hdr + len(THREAD_KEY)] = THREAD_KEY
+            meta["key_va"] = va + hdr
+        elif role == "cached" and include_tcache:
+            idx = _tcache_index(size, ptr)
+            tcache.setdefault(idx, []).append(va + hdr)
+            state, label = ChunkState.CACHED, f"tcache[{idx}]"
+            meta["cached_chunk_va"] = va
+        elif role == "small":
+            index = size >> (4 if ptr == 8 else 3)
+            header = top_slot + 2 * (index - 1) * ptr
+            bins[header] = (va, va)
+            _put_word(buf, off + hdr, header, ptr)
+            _put_word(buf, off + hdr + ptr, header, ptr)
+            state, label = ChunkState.FREE, f"smallbin[{index}]"
+            meta["smallbin_chunk_va"], meta["smallbin_header_va"] = va, header
+        elif role == "after":
+            flags = NON_MAIN_ARENA                            # predecessor is free
+            _put_word(buf, off, prev_size, ptr)
+        _put_word(buf, off + ptr, size | flags, ptr)
+        chunks.append(ExpectedChunk(va, size, state, hdr, size - hdr, label, flags))
+        prev_size = size
+        off += size
+    if include_tcache:
+        _write_tcache(buf, tcache, first_va + hdr, base_va, ptr, safe_linking)
+    return chunks, meta, bins, off
+
+
+def _fence_and_second_heap(buf: bytearray, base_va: int, off: int,
+                           chunks: List[ExpectedChunk], arena: int, ptr: int,
+                           glibc_235: bool,
+                           old_top_bin: Optional[Tuple[int, Dict[int, Tuple[int, int]]]] = None,
+                           ) -> Tuple[int, bytearray]:
+    """Close heap 1 with a filler + fencepost; build heap 2 (one chunk + top).
+
+    *old_top_bin* ``(unsorted bin header VA, bins)`` frees the filler into
+    the unsorted bin (see :func:`glibc_thread_arena`).
+    """
+    hdr, used = 2 * ptr, PREV_INUSE | NON_MAIN_ARENA
+    fence = len(buf) - 2 * hdr
+    filler_va, fence_flags = base_va + off, PREV_INUSE
+    _write_boundary_chunk(buf, off, (fence - off) | used, ptr)
+    state, label, fence_prev = ChunkState.IN_USE, None, 0
+    if old_top_bin is not None:
+        header, bins = old_top_bin
+        bins[header] = (filler_va, filler_va)
+        _put_word(buf, off + hdr, header, ptr)
+        _put_word(buf, off + hdr + ptr, header, ptr)
+        state, label, fence_prev, fence_flags = (ChunkState.FREE, "unsorted",
+                                                 fence - off, 0)
+    chunks.append(ExpectedChunk(filler_va, fence - off, state, hdr,
+                                fence - off - hdr, label, used))
+    _write_boundary_chunk(buf, fence, hdr | fence_flags, ptr, prev_size=fence_prev)
+    _write_boundary_chunk(buf, fence + hdr, 0 | PREV_INUSE, ptr, prev_size=hdr)
+    chunks.append(ExpectedChunk(base_va + fence, hdr, ChunkState.IN_USE, hdr, 0,
+                                "fencepost", fence_flags))
+    second_va = base_va + heap_max_size(ptr)
+    second = bytearray(PAGE)
+    _write_heap_info(second, arena, base_va, PAGE, ptr, glibc_235)
+    off2 = heap_info_size(ptr, glibc_235=glibc_235)
+    size = 0x40 * ptr // 8
+    _write_boundary_chunk(second, off2, size | used, ptr)
+    _fill(second, off2 + hdr, size - hdr, 0x71)
+    chunks.append(ExpectedChunk(second_va + off2, size, ChunkState.IN_USE, hdr,
+                                size - hdr, None, used))
+    top_off2 = off2 + size
+    _write_boundary_chunk(second, top_off2, (PAGE - top_off2) | PREV_INUSE, ptr)
+    chunks.append(ExpectedChunk(second_va + top_off2, PAGE - top_off2, ChunkState.FREE,
+                                hdr, PAGE - top_off2 - hdr, "top", PREV_INUSE))
+    return second_va + top_off2, second
+
+
+IS_MMAPPED = 0x2
+MMAPPED_VA = 0x7F00_0050_0000
+
+
+def _write_mmapped(buf: bytearray, off: int, size: int, correction: int, ptr: int,
+                   payload: Optional[bytes]) -> ExpectedChunk:
+    """One ``sysmalloc`` mmap-path chunk filling ``buf[off:off + size]``.
+
+    glibc ``malloc/malloc.c``: ``p = mm + correction; set_prev_size (p,
+    correction); set_head (p, (size - correction) | IS_MMAPPED)``.
+    """
+    hdr, csize = 2 * ptr, size - correction
+    _put_word(buf, off + correction, correction, ptr)
+    _put_word(buf, off + correction + ptr, csize | IS_MMAPPED, ptr)
+    user = off + correction + hdr
+    _fill(buf, user, csize - hdr, 0x6D)
+    if payload is not None:
+        buf[user:user + len(payload)] = payload
+    return ExpectedChunk(correction + off, csize, ChunkState.IN_USE, hdr, csize - hdr,
+                         "mmapped", IS_MMAPPED)
+
+
+def glibc_mmapped_chunks(va: int = MMAPPED_VA, sizes: Sequence[int] = (0x21000,), *,
+                         pointer_size: int = 8, correction: int = 0,
+                         payload: Optional[bytes] = None,
+                         region_name: str = "") -> SynthHeap:
+    """Back-to-back mmapped chunks in one anonymous ``rw-p`` region.
+
+    Each entry of *sizes* is one whole (page-multiple) mapping, as the
+    kernel merges adjacent anonymous maps; *payload* goes at the start of
+    the first chunk's user data (``meta["user_va"]``).
+    """
+    buf, chunks, off = bytearray(sum(sizes)), [], 0
+    for idx, size in enumerate(sizes):
+        chunk = _write_mmapped(buf, off, size, correction, pointer_size,
+                               payload if idx == 0 else None)
+        chunks.append(dataclasses_replace(chunk, va=va + chunk.va))
+        off += size
+    return SynthHeap(bytes(buf), va, AllocatorKind.PTMALLOC2.value, pointer_size,
+                     [(va, len(buf), region_name)], chunks,
+                     (va + correction, va + len(buf)), ["rw-p"],
+                     {"user_va": chunks[0].va + 2 * pointer_size})
+
+
+def glibc_mmapped_chunk(va: int = MMAPPED_VA, size: int = 0x21000, *,
+                        pointer_size: int = 8, correction: int = 0,
+                        payload: Optional[bytes] = None) -> SynthHeap:
+    """One mmapped chunk: a *size*-byte anonymous mapping (``""`` name, rw)."""
+    return glibc_mmapped_chunks(va, (size,), pointer_size=pointer_size,
+                                correction=correction, payload=payload)
 
 
 def dlmalloc_heap(base_va: Optional[int] = None, *, pointer_size: int = 8,

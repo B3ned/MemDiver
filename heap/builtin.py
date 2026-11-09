@@ -71,6 +71,7 @@ class BuiltinSpec(NamedTuple):
     heuristic: bool = False
     parse: Optional[ParseFn] = None
     probe: Optional[ProbeFn] = None
+    reduce_ready: bool = False
 
 
 def _parser_overrides() -> Dict[AllocatorKind, Tuple[ProbeFn, ParseFn]]:
@@ -85,14 +86,16 @@ _OVERRIDES = _parser_overrides()
 
 
 def _spec(kind: AllocatorKind, priority: int, levels: FrozenSet[str],
-          *, partial: bool = False, heuristic: bool = False) -> BuiltinSpec:
+          *, partial: bool = False, heuristic: bool = False,
+          reduce_ready: bool = False) -> BuiltinSpec:
     probe, parse = _OVERRIDES[kind]
     return BuiltinSpec(kind, priority, levels, partial, heuristic,
-                       parse=parse, probe=probe)
+                       parse=parse, probe=probe, reduce_ready=reduce_ready)
 
 
 BUILTIN_SPECS: List[BuiltinSpec] = [
-    _spec(AllocatorKind.PTMALLOC2, 50, _levels("L0", "L1", "L2", "L3")),
+    _spec(AllocatorKind.PTMALLOC2, 50, _levels("L0", "L1", "L2", "L3"),
+          reduce_ready=True),
     _spec(AllocatorKind.SCUDO, 50, _levels("L0", "L1", "L2"), partial=True),
     _spec(AllocatorKind.MALLOCNG, 50, _levels("L0", "L1", "L2")),
     _spec(AllocatorKind.DLMALLOC, 40, _levels("L0", "L1", "L2")),
@@ -106,6 +109,7 @@ def builtin_descriptor(spec: BuiltinSpec) -> AllocatorDescriptor:
         kind=spec.kind, detect=name_detector(spec.kind, spec.probe),
         parse=spec.parse, priority=spec.priority, levels=spec.levels,
         partial=spec.partial, heuristic=spec.heuristic,
+        reduce_ready=spec.reduce_ready,
     )
 
 

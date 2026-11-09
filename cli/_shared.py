@@ -64,16 +64,26 @@ ALLOCATOR_CHOICES = ("auto", "ptmalloc2", "dlmalloc", "scudo",
 #: heap analysis entirely.
 PIPELINE_ALLOCATOR_CHOICES = ALLOCATOR_CHOICES + ("off",)
 
+#: ``--allocator`` choices on the incremental session (``consensus-begin``)
+#: whose heap projections feed ``search-reduce``. The concrete names must equal
+#: ``memdiver.heap.registry.reduce_ready_kinds()`` (parity is test-guarded;
+#: this module depends only on ``core`` so it cannot import ``heap``).
+SEARCH_REDUCE_ALLOCATOR_CHOICES = ("auto", "ptmalloc2", "off")
+
 #: ``--heap-policy`` choices (``engine.candidate_pipeline.HEAP_POLICIES``).
 HEAP_POLICY_CHOICES = ("off", "annotate", "mask")
 
 
-def add_allocator_argument(parser: argparse.ArgumentParser) -> None:
+_ALLOCATOR_HELP = ("Heap allocator for the non-destructive heap-role annotation "
+                   "(default: auto-detect; 'off' disables heap analysis)")
+
+
+def add_allocator_argument(parser: argparse.ArgumentParser,
+                           choices: "tuple[str, ...]" = PIPELINE_ALLOCATOR_CHOICES,
+                           help_text: str = _ALLOCATOR_HELP) -> None:
     """Register ``--allocator`` (heap-role annotation of the consensus)."""
-    parser.add_argument(
-        "--allocator", choices=PIPELINE_ALLOCATOR_CHOICES, default="auto",
-        help="Heap allocator for the non-destructive heap-role annotation "
-             "(default: auto-detect; 'off' disables heap analysis)")
+    parser.add_argument("--allocator", choices=choices, default="auto",
+                        help=help_text)
 
 
 def add_mixed_ok_argument(parser: argparse.ArgumentParser) -> None:

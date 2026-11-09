@@ -132,6 +132,8 @@ class AllocatorDescriptor:
     detection … ``"L3"`` free-list walk); ``partial`` marks a parser that
     covers only part of the allocator, ``heuristic`` one that guesses
     structure instead of reading it. ``parse=None`` means detect-only.
+    ``reduce_ready`` opts the allocator in to heap-aware candidate
+    reduction: set it only once the parser is validated for that use.
     """
 
     kind: AllocatorKind
@@ -141,6 +143,7 @@ class AllocatorDescriptor:
     levels: FrozenSet[str] = frozenset({"L0"})
     partial: bool = False
     heuristic: bool = False
+    reduce_ready: bool = False
 
 
 @dataclass(frozen=True)
@@ -185,6 +188,12 @@ def get_allocator(kind: AllocatorKind | str) -> Optional[AllocatorDescriptor]:
     _ensure_loaded()
     entry = _ALLOCATOR_REGISTRY.get(AllocatorKind(kind))
     return entry.descriptor if entry is not None else None
+
+
+def reduce_ready_kinds() -> Tuple[AllocatorKind, ...]:
+    """Kinds whose descriptor opted in to candidate reduction (priority order)."""
+    return tuple(desc.kind for desc in registered_allocators()
+                 if desc.reduce_ready)
 
 
 def run_detector(desc: AllocatorDescriptor, ctx: DetectContext) -> DetectScore:

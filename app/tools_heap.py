@@ -197,8 +197,8 @@ def _summary_payload(layout: HeapLayout) -> Dict[str, Any]:
     return {
         **_allocator_block(layout),
         "platform": _platform_dict(layout.platform),
-        "regions": [{"va": r.va, "size": r.size, "name": r.name, "kind": r.kind}
-                    for r in layout.regions],
+        "regions": [r.to_dict() for r in layout.regions],
+        "arenas": overview["arenas"],
         "chunk_count": len(layout.chunks),
         "counts_by_state": _counts_by_state(layout.chunks),
         "bytes_by_state": _bytes_by_state(layout.chunks),
@@ -512,6 +512,7 @@ def _free_list_row(layout: HeapLayout, free_list: FreeList) -> Dict[str, Any]:
         "cycle": free_list.cycle,
         "corrupt": bool(unresolved),
         "unresolved_vas": unresolved,
+        **({} if free_list.arena_id is None else {"arena_id": free_list.arena_id}),
     }
 
 

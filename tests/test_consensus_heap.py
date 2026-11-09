@@ -283,3 +283,204 @@ def test_empty_results_serialize():
     assert summary["report"]["status"] == ch.STATUS_NO_VA
     assert summary["runs"]["run_count"] == 0
     assert HeapChunkIndex.empty().chunk_at(0) is None
+
+
+# -- per-dump projection + incremental assembly -----------------------------------
+
+
+_SLAB = 1 << 20
+
+
+def _project_paths(paths, allocator="auto"):
+    """``[(projection, record)]`` for each path, opened like build_consensus."""
+    from memdiver.engine.consensus_service import open_consensus_sources
+
+    with open_consensus_sources(paths) as sources:
+        return [ch.project_dump_heap(src, _SLAB, allocator, index=i)
+                for i, src in enumerate(sources)]
+
+
+def test_dump_projection_npz_round_trip_keeps_dtypes(tmp_path):
+    (proj, _record), = _project_paths(_msl_dumps(tmp_path, _same_layout()[:1]))
+    path = tmp_path / "proj.npz"
+    proj.to_npz(path)
+    with np.load(path) as data:
+        assert sorted(data.files) == sorted(
+            ["pieces_starts", "pieces_lengths", "pieces_roles",
+             "chunk_slabs", "chunk_sizes", "chunk_states", "chunk_arena_kinds"])
+    back = ch.DumpHeapProjection.from_npz(path)
+    for got, want in zip((*back.pieces, back.chunk_slabs, back.chunk_sizes,
+                          back.chunk_states),
+                         (*proj.pieces, proj.chunk_slabs, proj.chunk_sizes,
+                          proj.chunk_states)):
+        assert got.dtype == want.dtype
+        np.testing.assert_array_equal(got, want)
+    assert not back.is_empty
+    assert ch._DumpProjection is ch.DumpHeapProjection
+
+
+def test_project_dump_heap_ok_on_msl(tmp_path):
+    (proj, record), = _project_paths(_msl_dumps(tmp_path, _same_layout()[:1]))
+    assert proj is not None
+    assert record["status"] == ch.STATUS_OK
+    assert record["projected"] is True
+    assert record["allocator"] == "ptmalloc2"
+    assert record["chunk_count"] == proj.chunk_slabs.size > 0
+
+
+def test_project_dump_heap_no_va_on_raw(tmp_path):
+    (proj, record), = _project_paths(_raw_dumps(tmp_path, _same_layout()[:1]))
+    assert proj is None
+    assert record["status"] == ch.STATUS_NO_VA
+    assert record["reason"] == "no_va_map"
+    assert record["projected"] is False
+
+
+def test_assemble_single_projection_agrees_with_itself(tmp_path):
+    (proj, record), = _project_paths(_msl_dumps(tmp_path, _same_layout()[:1]))
+    heap = ch.assemble_heap([(0, proj)], [record], "auto",
+                            ch.COORDINATE_FLAT_VIEW)
+    assert heap.status == ch.STATUS_OK
+    assert heap.report["dumps_projected"] == 1
+    assert len(heap.runs) > 0 and set(heap.runs.agree.tolist()) == {1}
+    assert len(heap.chunks) > 0 and set(heap.chunks.agree.tolist()) == {1}
+
+
+def test_assemble_no_projections_is_no_va(tmp_path):
+    heap = ch.assemble_heap([], [{"index": 0}], "auto", ch.COORDINATE_FLAT_VIEW)
+    assert heap.status == ch.STATUS_NO_VA
+    assert heap.per_dump == [{"index": 0}]
+    assert heap.runs.fill == HeapRole.UNCOVERED
+
+
+def _assert_heaps_equal(got, want):
+    for name in ("starts", "lengths", "roles", "agree"):
+        a, b = getattr(got.runs, name), getattr(want.runs, name)
+        assert a.dtype == b.dtype
+        np.testing.assert_array_equal(a, b)
+    assert got.runs.fill == want.runs.fill
+    for name, arr in got.chunks.to_arrays().items():
+        other = want.chunks.to_arrays()[name]
+        assert arr.dtype == other.dtype
+        np.testing.assert_array_equal(arr, other)
+    assert got.report == want.report
+
+
+@pytest.mark.parametrize("kind", sorted(_WRITERS))
+@pytest.mark.parametrize("jitter", [False, True])
+def test_incremental_assembly_matches_compute_on_flat_view(tmp_path, kind,
+                                                           jitter):
+    """project_dump_heap + npz + assemble_heap == compute_consensus_heap (flat)."""
+    from types import SimpleNamespace
+
+    from memdiver.engine.consensus_service import open_consensus_sources
+
+    heaps = [_variant(0), _variant(1), _variant(2, jitter=jitter)]
+    paths = _WRITERS[kind](tmp_path, heaps)
+    cm = SimpleNamespace(size=_SLAB, msl_layout=None)
+    with open_consensus_sources(paths) as sources:
+        want = ch.compute_consensus_heap(cm, sources, "auto")
+        pairs = [ch.project_dump_heap(s, _SLAB, "auto", index=i)
+                 for i, s in enumerate(sources)]
+    done = []
+    for i, (proj, _rec) in enumerate(pairs):
+        proj.to_npz(tmp_path / f"p{i}.npz")
+        done.append((i, ch.DumpHeapProjection.from_npz(tmp_path / f"p{i}.npz")))
+    got = ch.assemble_heap(done, [r for _p, r in pairs], "auto",
+                           ch.COORDINATE_FLAT_VIEW)
+    assert want.status == ch.STATUS_OK
+    _assert_heaps_equal(got, want)
+    assert ([{k: v for k, v in r.items() if k != "status"} for r in got.per_dump]
+            == want.per_dump)
+
+
+# -- arena kinds ------------------------------------------------------------------
+
+
+def _arena_process_dump(tmp_path):
+    """Regioned dump of a main heap + libc ``main_arena`` + thread arena + mmapped chunk."""
+    from tests.test_heap_msl import arena_process_heaps
+
+    heaps, meta = arena_process_heaps()
+    return sh.as_regioned_raw(tmp_path / "proc", heaps, stem="proc"), meta
+
+
+def _anchor_index(tmp_path):
+    """``(HeapChunkIndex, slab_of_va, meta)`` of the arena-process dump."""
+    path, meta = _arena_process_dump(tmp_path)
+    (proj, record), = _project_paths([path])
+    assert record["status"] == ch.STATUS_OK
+    source = sh.open_regioned(path)
+    try:
+        chunks = heap_analyze.analyze_heap(source).chunks
+    finally:
+        source.close()
+    slab_by_chunk_va = dict(zip((c.va for c in chunks), proj.chunk_slabs.tolist()))
+
+    def slab_of(va):
+        chunk = next(c for c in chunks if c.contains(va))
+        return slab_by_chunk_va[chunk.va] + va - chunk.va
+
+    return ch._chunk_index(proj, []), slab_of, meta, proj
+
+
+def test_arena_kind_codes_round_trip():
+    for kind in ch.ARENA_KIND_CODES:
+        assert ch.arena_kind_name(ch.arena_kind_code(kind)) == kind
+    assert ch.arena_kind_code(None) == 0
+    assert ch.arena_kind_name(ch.arena_kind_code("zone")) == "other"
+    assert ch.arena_kind_name(255) == ""
+
+
+def test_chunk_at_carries_thread_and_mmap_arena(tmp_path):
+    index, slab_of, meta, _proj = _anchor_index(tmp_path)
+    assert index.chunk_at(slab_of(meta["thread_key_va"]))["arena"] == "thread"
+    assert index.chunk_at(slab_of(meta["mmap_key_va"]))["arena"] == "mmap"
+    assert {ch.arena_kind_name(k) for k in index.arena_kinds} == {
+        "main", "thread", "mmap"}
+
+
+def test_chunk_at_omits_unknown_arena():
+    index = HeapChunkIndex(np.asarray([0], dtype=np.int64),
+                           np.asarray([32], dtype=np.int64),
+                           np.zeros(1, dtype=np.uint8), np.ones(1, dtype=np.uint16))
+    assert index.arena_kinds.tolist() == [0]
+    assert "arena" not in index.chunk_at(4)
+
+
+def test_projection_npz_round_trip_keeps_arena_kinds(tmp_path):
+    _index, _slab_of, _meta, proj = _anchor_index(tmp_path)
+    path = tmp_path / "proj.npz"
+    proj.to_npz(path)
+    back = ch.DumpHeapProjection.from_npz(path)
+    assert back.chunk_arena_kinds.dtype == np.uint8
+    np.testing.assert_array_equal(back.chunk_arena_kinds, proj.chunk_arena_kinds)
+    assert proj.chunk_arena_kinds.any()
+
+
+def test_projection_npz_without_arena_kinds_loads(tmp_path):
+    _index, _slab_of, _meta, proj = _anchor_index(tmp_path)
+    path = tmp_path / "old.npz"
+    np.savez_compressed(path, pieces_starts=proj.pieces[0],
+                        pieces_lengths=proj.pieces[1], pieces_roles=proj.pieces[2],
+                        chunk_slabs=proj.chunk_slabs, chunk_sizes=proj.chunk_sizes,
+                        chunk_states=proj.chunk_states)
+    back = ch.DumpHeapProjection.from_npz(path)
+    assert back.chunk_arena_kinds.tolist() == [0] * proj.chunk_slabs.size
+    hit = ch._chunk_index(back, []).chunk_at(int(proj.chunk_slabs.max()))
+    assert hit is not None and "arena" not in hit
+
+
+def test_heap_npz_round_trip_and_old_file_without_arena_kinds(tmp_path):
+    index, slab_of, meta, _proj = _anchor_index(tmp_path)
+    heap = ConsensusHeap(HeapRoleRuns.empty(), index)
+    path = tmp_path / "heap_roles.npz"
+    ch.save_heap_npz(heap, path)
+    _runs, back = ch.load_heap_npz(path)
+    np.testing.assert_array_equal(back.arena_kinds, index.arena_kinds)
+    assert back.chunk_at(slab_of(meta["thread_key_va"]))["arena"] == "thread"
+    with np.load(path) as data:
+        old = {k: data[k] for k in data.files if k != "chunk_arena_kinds"}
+    np.savez_compressed(path, **old)
+    _runs, legacy = ch.load_heap_npz(path)
+    assert len(legacy) == len(index) and not legacy.arena_kinds.any()

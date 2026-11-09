@@ -241,8 +241,11 @@ memdiver locate-key dumps/ --key-hex '<hex>' --allocator ptmalloc2 -o loc.json
 The JSON payload carries the heap data as it is. On stderr, `consensus`
 prints a `heap status=...` line, and `analyze-candidates` and `locate-key`
 print one line per chunk-resident candidate or hit, with hits in freed chunks
-marked `residual`. `search-reduce` reads a Welford `--state` session that has
-no heap roles, so `annotate` does nothing there and `mask` is refused.
+marked `residual`. `search-reduce` takes `--allocator {auto,ptmalloc2,off}`
+(default `auto`): it uses the heap projections a session begun with
+`consensus-begin --allocator auto` recorded, else the `--reference-dump`
+alone, and `--allocator off` keeps the historical payload. See
+[Allocator-aware search-reduce](../user_guide/heap.md#allocator-aware-search-reduce).
 
 ## Importing only some regions
 

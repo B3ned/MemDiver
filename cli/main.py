@@ -73,6 +73,7 @@ from ._shared import (
     add_heap_policy_argument,
     add_keylog_anchor_arguments,
     add_mixed_ok_argument,
+    SEARCH_REDUCE_ALLOCATOR_CHOICES,
     to_cli_exit,
 )
 from .import_keys import decrypt_output_parent_parser
@@ -242,6 +243,7 @@ def _build_parser() -> argparse.ArgumentParser:
                          "experiment cohort is recorded and enforced by "
                          "consensus-add")
     add_mixed_ok_argument(cb)
+    add_allocator_argument(cb, choices=SEARCH_REDUCE_ALLOCATOR_CHOICES)
     cb.add_argument("-v", "--verbose", action="store_true")
     ca = sub.add_parser(
         "consensus-add",
@@ -466,8 +468,16 @@ def _build_parser() -> argparse.ArgumentParser:
                          "region carries 'rank' and 'score' either way.")
     sr.add_argument("-o", "--output", required=True, help="Output candidates.json")
     sr.add_argument("-v", "--verbose", action="store_true")
-    # The Welford --state session carries no heap roles, so 'annotate' is a
-    # no-op here and 'mask' is refused (use analyze-candidates for heap work).
+    # Heap roles come from the --state session's per-dump projections
+    # (consensus-begin --allocator auto|ptmalloc2), else from the reference
+    # dump alone; --allocator off keeps the historical payload.
+    add_allocator_argument(
+        sr, choices=SEARCH_REDUCE_ALLOCATOR_CHOICES,
+        help_text="Heap allocator for heap-aware reduction (default: auto). "
+                  "Uses the session's merged heap projections when "
+                  "consensus-begin recorded them, else analyses the "
+                  "--reference-dump alone; ptmalloc2 only. 'off' disables "
+                  "heap analysis (and is refused with --heap-policy mask)")
     add_heap_policy_argument(sr)
     # analyze-candidates (the exploratory path: no oracle, no capture)
     ac = sub.add_parser(

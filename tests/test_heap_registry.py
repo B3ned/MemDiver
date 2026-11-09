@@ -136,3 +136,17 @@ def test_detect_context_is_lazy():
     ctx = DetectContext(object())
     assert "regions" not in ctx.__dict__
     assert ctx.regions == [] and ctx.modules == []
+
+
+def test_reduce_ready_kinds_is_ptmalloc2_only():
+    assert registry.reduce_ready_kinds() == (AllocatorKind.PTMALLOC2,)
+
+
+def test_third_party_descriptor_defaults_not_reduce_ready(restore_registry):
+    desc = AllocatorDescriptor(AllocatorKind.SCUDO, _fixed(0.5))
+    assert desc.reduce_ready is False
+    register_allocator(desc)
+    assert AllocatorKind.SCUDO not in registry.reduce_ready_kinds()
+    register_allocator(AllocatorDescriptor(AllocatorKind.SCUDO, _fixed(0.5),
+                                           reduce_ready=True))
+    assert AllocatorKind.SCUDO in registry.reduce_ready_kinds()

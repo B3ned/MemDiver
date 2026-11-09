@@ -5,6 +5,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- `search-reduce --allocator {auto,ptmalloc2,off}` (default `auto`): the CLI reduction
+  is heap-aware. Candidate regions get `heap` annotations, `--heap-policy mask` works on
+  a `--state` session, and the payload gains a compact `heap` block (status, source,
+  report, per-dump records), `heap_status` and `thresholds.allocator`. `--allocator off`
+  keeps the historical payload; `off` with `mask` is an argument error.
+- `consensus-begin --allocator {auto,ptmalloc2,off}`: every `consensus-add` stores a
+  per-dump heap projection beside the state (`<stem>.heap/NNNN.npz`); re-beginning a
+  session removes stale projections.
+- Session-merged heap roles: `search-reduce` merges the stored projections (role
+  agreement over N dumps) and falls back to the reference dump alone for sessions
+  without them, naming the source on stderr.
+- ptmalloc2 thread arenas: non-main arenas are found through the `main_arena.next` ring
+  or, without `main_arena`, a `heap_info` scan of `HEAP_MAX_SIZE`-aligned anonymous
+  maps. Their heaps are walked as `thread_heap` regions of arenas 1..n with their
+  tcache (and, for ring discovery, their bins) decoded; coverage gains `thread_arenas`
+  and `arena_discovery`.
+- ptmalloc2 mmapped chunks: a page-granular scan of captured, writable, anonymous,
+  non-heap / non-stack regions finds `{prev_size, size|IS_MMAPPED}` headers. Each hit is
+  an in-use chunk (bin `mmapped`, region kind `mmapped_chunk`) in a pseudo arena of kind
+  `mmap`; an explicit `--regions` limits the scan; coverage gains `mmapped_chunks`.
+- Arena / segment parser interface: `HeapArena` and `HeapLayout.arenas`, `arena_id` on
+  chunks, regions and free lists, the shared `ARENA_*` / `REGION_*` kinds, and
+  `heap/segments.py` (`HeapSegment`, `ChunkBudget`, `LayoutAssembler`) with standard
+  coverage keys. `AllocatorDescriptor.reduce_ready` / `reduce_ready_kinds()` gate which
+  allocators `search-reduce` accepts (parity with the CLI choices is test-guarded). See
+  `docs/contributing/adding_allocator.md`.
+
+### Changed
+- The `heap_policy='mask'` precondition error names the unavailable status and its
+  cause (`no_va_coordinate`, `unsupported_allocator`, ...).
+
 ## [1.0.7] — 2026-11-04
 
 ### Fixed

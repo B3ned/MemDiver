@@ -19,6 +19,8 @@ from ._shared import (
     _write_output,
     force_memory_requested,
 )
+from ._search_reduce_heap import (attach_reduce_heap, effective_allocator, heap_policy_of,
+                                  prepare_reduce_heap)
 from .consensus import _load_welford_session
 from .heap_report import report_candidate_heap, report_locate_key_heap
 
@@ -77,6 +79,12 @@ def _cmd_search_reduce(args: argparse.Namespace) -> int:
     parameters. They are read with ``getattr`` defaults because this handler is
     also driven by hand-built ``argparse.Namespace`` objects that predate the
     flags; an omitted flag reproduces the pre-flag reduction exactly.
+
+    ``--allocator`` (auto | ptmalloc2 | off) makes the reduction heap-aware:
+    the session's merged heap projections (or the reference dump's, for a
+    session without them) are written as ``heap_roles.npz`` beside the scratch
+    variance, and the payload gains a compact ``heap`` block. A Namespace
+    without ``allocator`` behaves as ``off`` (the historical payload).
     """
     import tempfile
 
@@ -84,10 +92,13 @@ def _cmd_search_reduce(args: argparse.Namespace) -> int:
 
     from memdiver.app.tools_pipeline import search_reduce
 
-    _state, welford = _load_welford_session(Path(args.state))
+    allocator = effective_allocator(args)
+    state, welford = _load_welford_session(Path(args.state))
     variance = welford.variance()
 
     with tempfile.TemporaryDirectory() as scratch:
+        heap = prepare_reduce_heap(args, state, len(variance), allocator,
+                                   Path(scratch))
         variance_path = Path(scratch) / "variance.npy"
         np.save(variance_path, variance)
         search_reduce(
@@ -109,9 +120,11 @@ def _cmd_search_reduce(args: argparse.Namespace) -> int:
             passphrase=args.passphrase,
             kem_key_file=args.kem_key_file,
             on_source=_warn_tag_status,
-            heap_policy=getattr(args, "heap_policy", "annotate"),
+            heap_policy=heap_policy_of(args),
         )
         payload = json.loads((Path(scratch) / "candidates.json").read_text())
+    attach_reduce_heap(payload, heap, allocator)
+    report_candidate_heap(payload, heap)
     _write_output(payload, args.output)
     return 0
 
@@ -154,7 +167,7 @@ def _cmd_analyze_candidates(args: argparse.Namespace) -> int:
         kem_key_file=args.kem_key_file,
         on_source=_warn_tag_status,
         force=force_memory_requested(args),
-        heap_policy=getattr(args, "heap_policy", "annotate"),
+        heap_policy=heap_policy_of(args),
         allocator=getattr(args, "allocator", "auto"),
     )
     for warning in payload["warnings"]:

@@ -35,13 +35,76 @@ def checked_heap_policy(heap_policy: str) -> str:
     return heap_policy
 
 
-def _mask_unavailable(reason: str) -> CapabilityError:
+def _mask_unavailable(reason: str, *, reduce_ready: bool = False) -> CapabilityError:
+    """PRECONDITION error for ``mask`` without usable heap roles.
+
+    Only paths that enforce a reduce-ready allocator (the ``search-reduce``
+    session / reference heap) pass ``reduce_ready=True``; the batch consensus
+    paths do not, so their message must not claim that requirement.
+    """
+    allocator_clause = (f" whose heap allocator is reduce-ready "
+                        f"({', '.join(reduce_ready_allocators())})"
+                        if reduce_ready else "")
     return CapabilityError(
         f"heap_policy='mask' needs consensus heap roles, but {reason}. "
-        f"Rebuild the consensus with an allocator other than 'off', or use "
-        f"heap_policy='annotate' / 'off'.",
+        f"Masking needs dumps with a VA map (.msl / core){allocator_clause} "
+        f"and heap analysis enabled (an allocator other than 'off'); "
+        f"otherwise use heap_policy='annotate' / 'off'.",
         category=ErrorCategory.PRECONDITION,
     )
+
+
+def _detected_allocator(heap: Any) -> Optional[Dict[str, Any]]:
+    """The detector verdict in the report, else the first per-dump one."""
+    detected = heap.report.get("detected")
+    for record in heap.per_dump:
+        detected = detected or record.get("detected")
+    return detected
+
+
+def _first_error(heap: Any) -> Optional[str]:
+    errors = [heap.report.get("error")] + [r.get("error") for r in heap.per_dump]
+    return next((e for e in errors if e), None)
+
+
+def heap_unavailable_reason(heap: Optional[Any]) -> str:
+    """``"<status>: <cause>"`` for a heap annotation that is not ``ok``."""
+    from memdiver.engine.consensus_heap import STATUS_EMPTY, STATUS_NO_VA, STATUS_UNSUPPORTED
+
+    if heap is None:
+        return "allocator='off': heap analysis is disabled"
+    status = heap.status
+    source = heap.report.get("source", "consensus")
+    if status == STATUS_NO_VA:
+        return f"{status}: {source} dump has no VA map (raw dump)"
+    if status == STATUS_UNSUPPORTED:
+        found = _detected_allocator(heap) or {}
+        return (f"{status}: detected {found.get('best', '?')} "
+                f"({found.get('confidence', '?')}); the reduction supports "
+                f"{', '.join(reduce_ready_allocators())}")
+    if status == STATUS_EMPTY:
+        return f"{status}: no heap projection was recorded"
+    return f"{status}: {_first_error(heap) or 'heap analysis failed'}"
+
+
+def require_heap_for_mask(heap: Optional[Any], heap_policy: str) -> None:
+    """PRECONDITION error when ``mask`` meets a missing / unusable heap."""
+    from memdiver.engine.consensus_heap import STATUS_OK
+
+    if heap_policy == "mask" and (heap is None or heap.status != STATUS_OK):
+        raise _mask_unavailable(
+            f"the heap annotation is unavailable ({heap_unavailable_reason(heap)})",
+            reduce_ready=True)
+
+
+def reduce_heap_block(heap: Any) -> Dict[str, Any]:
+    """Compact payload block: status, report fields and per-dump records.
+
+    Unlike :func:`write_consensus_heap`'s block it carries no run / chunk
+    summaries and no ``heap_roles_path`` (the reduce's npz is scratch).
+    """
+    return {"status": heap.status, **heap.report,
+            "per_dump": [dict(r) for r in heap.per_dump]}
 
 
 def write_consensus_heap(heap: Optional[Any], out_dir: Path) -> Optional[Dict[str, Any]]:
@@ -104,3 +167,10 @@ def heap_inputs_from_consensus(cm: Any, heap_policy: str) -> HeapInputs:
 def allocator_for_policy(allocator: str, heap_policy: str) -> str:
     """``"off"`` when the policy ignores heap roles (skip the analysis cost)."""
     return "off" if heap_policy == "off" else allocator
+
+
+def reduce_ready_allocators() -> Tuple[str, ...]:
+    """Allocator names whose heap roles may feed a candidate reduction."""
+    from memdiver.heap.registry import reduce_ready_kinds
+
+    return tuple(kind.value for kind in reduce_ready_kinds())
