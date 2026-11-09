@@ -784,6 +784,21 @@ describe("pipeline-store v1 -> v2 stride migration", () => {
     await usePipelineStore.persist.rehydrate();
     expect(usePipelineStore.getState().form.pcapPairs).toEqual(pairs);
   });
+
+  /** The same additive rule for ``form.scudo``: no version bump. */
+  it("backfills form.scudo as null on a CURRENT-version blob", async () => {
+    seedV1(V1_FORM, 3);
+    await usePipelineStore.persist.rehydrate();
+    const { form } = usePipelineStore.getState();
+    expect(form.scudo).toBeNull();
+    expect(form.sourcePaths).toEqual(["/dumps/a.msl", "/dumps/b.msl"]);
+  });
+
+  it("keeps a Scudo selection across a reload", async () => {
+    seedV1({ ...V1_FORM, scudo: { allocator: "scudo" } }, 3);
+    await usePipelineStore.persist.rehydrate();
+    expect(usePipelineStore.getState().form.scudo).toEqual({ allocator: "scudo" });
+  });
 });
 
 /**
@@ -1125,5 +1140,59 @@ describe("pipeline-store rehydrate status", () => {
     seed(null);
     await usePipelineStore.persist.rehydrate();
     expect(usePipelineStore.getState().status).toBe("idle");
+  });
+});
+
+describe("reducePipelineEvent Scudo search_reduce", () => {
+  const SUMMARY = {
+    source: "search-reduce:scudo" as const,
+    num_regions: 1,
+    num_dumps: 3,
+    reference_dump: "/dumps/a.msl",
+    funnel: { signature_unique: { chunks: 1, bytes: 40 } },
+    totals: { regions: 1, bytes: 40, key_sizes: [40], stride: 1, windows: 1 },
+    not_judged: { chunks: 0, bytes: 0 },
+    diagnostics: [{ code: "scudo.scope_fallback", message: "fallback", severity: "warning" }],
+  };
+
+  it("keeps the verdict summary of a Scudo stage_end", () => {
+    const patch = reducePipelineEvent(
+      baseState(),
+      event("stage_end", { stage: "search_reduce", extra: SUMMARY }),
+    );
+    expect(patch.scudoSummary).toEqual(SUMMARY);
+    expect(patch.activeStage).toBe("search_reduce");
+  });
+
+  it("ignores a positional search_reduce stage_end", () => {
+    const patch = reducePipelineEvent(
+      baseState(),
+      event("stage_end", { stage: "search_reduce", extra: { num_regions: 4 } }),
+    );
+    expect(patch).not.toHaveProperty("scudoSummary");
+  });
+
+  it("does not let a brute_force stage_end touch the Scudo diagnostics", () => {
+    const patch = reducePipelineEvent(
+      baseState({ scudoSummary: SUMMARY }),
+      event("stage_end", { stage: "brute_force", extra: { warnings: [] } }),
+    );
+    expect(patch.warnings).toEqual([]);
+    expect(patch).not.toHaveProperty("scudoSummary");
+  });
+
+  it("starts every new run without a summary", () => {
+    const PRISTINE = usePipelineStore.getState();
+    try {
+      usePipelineStore.setState({ scudoSummary: SUMMARY });
+      usePipelineStore.getState().setTaskId("next-task");
+      expect(usePipelineStore.getState().scudoSummary).toBeNull();
+    } finally {
+      usePipelineStore.setState(PRISTINE, true);
+    }
+  });
+
+  it("defaults to the positional method", () => {
+    expect(usePipelineStore.getState().form.scudo).toBeNull();
   });
 });

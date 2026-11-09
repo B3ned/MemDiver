@@ -1,6 +1,7 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 
-import { artifactDownloadUrl } from "@/api/pipeline";
+import { artifactDownloadUrl, runPipeline } from "@/api/pipeline";
+import { useRegionSelectionStore } from "@/stores/region-selection-store";
 import type {
   LocateFieldPairsResult,
   PcapField,
@@ -470,5 +471,51 @@ describe("LocateFieldPairsResult", () => {
     expect(
       result.counts.pairs_present + result.counts.pairs_absent,
     ).toBe(result.counts.pairs_searched);
+  });
+});
+
+describe("PipelineRunRequest scudo", () => {
+  it("names the method without a reduce block", () => {
+    const body: PipelineRunRequest = {
+      source_paths: ["/d/a.msl", "/d/b.msl"],
+      scudo: { allocator: "auto" },
+      brute_force: { key_sizes: [48] },
+    };
+    expect(JSON.parse(JSON.stringify(body))).toEqual({
+      source_paths: ["/d/a.msl", "/d/b.msl"],
+      scudo: { allocator: "auto" },
+      brute_force: { key_sizes: [48] },
+    });
+  });
+});
+
+describe("runPipeline and the session region filter", () => {
+  afterEach(() => {
+    useRegionSelectionStore.getState().reset();
+    vi.unstubAllGlobals();
+  });
+
+  async function postedBody(body: PipelineRunRequest): Promise<Record<string, unknown>> {
+    useRegionSelectionStore.getState().setRegionFilter("heap,stack");
+    const fetchMock = vi.fn(
+      async () => new Response(JSON.stringify({ task_id: "t", status: "pending" }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await runPipeline(body);
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    return JSON.parse(init.body as string) as Record<string, unknown>;
+  }
+
+  it("attaches the wizard's filter to a positional run", async () => {
+    const body = await postedBody({ source_paths: ["/d/a.msl"] });
+    expect(body.region_filter).toBe("heap,stack");
+  });
+
+  it("leaves it off a Scudo run, which the server would refuse", async () => {
+    const body = await postedBody({
+      source_paths: ["/d/a.msl", "/d/b.msl"],
+      scudo: { allocator: "auto" },
+    });
+    expect(body).not.toHaveProperty("region_filter");
   });
 });

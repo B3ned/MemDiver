@@ -35,6 +35,7 @@ import type {
   PcapSession,
   PipelineRunRequest,
   ReduceParams,
+  ScudoParams,
   StageRecord,
   TaskRecord,
   TaskStatus,
@@ -52,7 +53,8 @@ import type {
 // ``StageDiagnostic`` is only declared in the wire-schema module and is not
 // part of the ``@/api/websocket`` re-export surface, so it is imported from
 // its defining module rather than redeclared here.
-import type { StageDiagnostic } from "@/api/progress-events";
+import type { ScudoReduceSummary, StageDiagnostic } from "@/api/progress-events";
+import { isScudoReduceStageEnd } from "@/api/progress-events";
 import { runPipeline } from "@/api/pipeline";
 import { readableFailure } from "@/api/client";
 import {
@@ -241,6 +243,9 @@ export interface PipelineFormValues {
   bruteForce: BruteForceParams;
   nsweep: NSweepParams | null;
   emit: EmitParams | null;
+  // The server refuses ``nsweep`` and ``emit`` for the Scudo method, so
+  // everything that selects it clears those two as well.
+  scudo: ScudoParams | null;
 }
 
 export interface PipelineState {
@@ -289,6 +294,8 @@ export interface PipelineState {
    * sentence composed by the backend and is rendered verbatim.
    */
   warnings: StageDiagnostic[];
+  /** Holds its own diagnostics because the brute_force ``stage_end`` replaces ``warnings``. */
+  scudoSummary: ScudoReduceSummary | null;
   inferredFields: InferredField[];
   artifacts: ArtifactSpec[];
   activeStage: string | null;
@@ -320,6 +327,12 @@ export interface PipelineState {
   setRefineLoading: (loading: boolean) => void;
 }
 
+/**
+ * Only the Scudo method has a key-size control, so leaving it restores this.
+ * A leftover 48 would otherwise apply to a positional run with no field showing it.
+ */
+export const DEFAULT_KEY_SIZES: number[] = [32];
+
 const DEFAULT_FORM: PipelineFormValues = {
   sourcePaths: [],
   oracleId: null,
@@ -337,7 +350,7 @@ const DEFAULT_FORM: PipelineFormValues = {
     min_region: 16,
   },
   bruteForce: {
-    key_sizes: [32],
+    key_sizes: DEFAULT_KEY_SIZES,
     stride: 1,
     // 0 = auto: the backend (engine.brute_force.resolve_jobs) stays serial for
     // a small or first-hit sweep and uses a small worker pool for a large
@@ -348,7 +361,10 @@ const DEFAULT_FORM: PipelineFormValues = {
   },
   nsweep: null,
   emit: null,
+  scudo: null,
 };
+
+export const DEFAULT_SCUDO: ScudoParams = { allocator: "auto" };
 
 const DEFAULT_FUNNEL: FunnelCounts = {
   raw: 0,
@@ -375,6 +391,7 @@ function baseRunState(): Pick<
   | "coverage"
   | "throughput"
   | "warnings"
+  | "scudoSummary"
   | "inferredFields"
   | "artifacts"
   | "activeStage"
@@ -394,6 +411,7 @@ function baseRunState(): Pick<
     coverage: null,
     throughput: null,
     warnings: [],
+    scudoSummary: null,
     inferredFields: [],
     artifacts: [],
     activeStage: null,
@@ -571,6 +589,9 @@ export function reducePipelineEvent(
         patch.activeStage = event.stage;
         patch.activeStagePct = 1;
         patch.activeStageMsg = event.msg ?? "";
+      }
+      if (isScudoReduceStageEnd(event)) {
+        patch.scudoSummary = event.extra;
       }
       // brute_force stage_end carries the verified count + hits.
       if (isBruteForceStageEnd(event)) {

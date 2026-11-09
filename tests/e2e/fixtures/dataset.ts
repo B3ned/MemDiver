@@ -77,6 +77,14 @@ export const glibcHeapExpectedPath = path.join(__dirname, "glibc_heap_msl", "exp
 export const glibcHeapMslAvailable =
   existsSync(glibcHeapMslPath) && existsSync(glibcHeapExpectedPath);
 
+// Regenerate with: python tests/e2e/fixtures/scudo_msl/generate.py
+export const scudoMslPaths = [1, 2, 3].map((run) =>
+  path.join(__dirname, "scudo_msl", `scudo_run_${run}.msl`),
+);
+export const scudoExpectedPath = path.join(__dirname, "scudo_msl", "expected.json");
+export const scudoMslAvailable =
+  scudoMslPaths.every((p) => existsSync(p)) && existsSync(scudoExpectedPath);
+
 // Committed ASLR-shifted .msl PAIR for the multi-dump specs (side-by-side
 // panes + cross-dump overlay). Regenerate with:
 //   python tests/e2e/fixtures/aslr_msl/generate.py

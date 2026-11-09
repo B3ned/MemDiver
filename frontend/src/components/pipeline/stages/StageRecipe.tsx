@@ -23,7 +23,7 @@
 import { useTranslation } from "react-i18next";
 
 import type { WizardStage } from "@/stores/pipeline-store";
-import { usePipelineStore } from "@/stores/pipeline-store";
+import { DEFAULT_KEY_SIZES, DEFAULT_SCUDO, usePipelineStore } from "@/stores/pipeline-store";
 
 const GOCRYPTFS_RECIPE = {
   reduce: {
@@ -82,8 +82,10 @@ interface Props {
 export function StageRecipe({ onAdvance }: Props) {
   const { t } = useTranslation("pipeline");
   const updateForm = usePipelineStore((s) => s.updateForm);
+  const bruteForce = usePipelineStore((s) => s.form.bruteForce);
 
   function startBlank(): void {
+    updateForm({ scudo: null, bruteForce: { ...bruteForce, key_sizes: DEFAULT_KEY_SIZES } });
     onAdvance("dumps");
   }
 
@@ -92,6 +94,19 @@ export function StageRecipe({ onAdvance }: Props) {
       reduce: GOCRYPTFS_RECIPE.reduce,
       bruteForce: GOCRYPTFS_RECIPE.bruteForce,
       nsweep: GOCRYPTFS_RECIPE.nsweep,
+      scudo: null,
+    });
+    onAdvance("dumps");
+  }
+
+  function startScudo(): void {
+    updateForm({
+      scudo: DEFAULT_SCUDO,
+      nsweep: null,
+      emit: null,
+      // A secret can sit anywhere in a chunk, and the gocryptfs recipe would
+      // otherwise leave its stride of 8 behind.
+      bruteForce: { ...bruteForce, stride: 1, exhaustive: true },
     });
     onAdvance("dumps");
   }
@@ -137,6 +152,20 @@ export function StageRecipe({ onAdvance }: Props) {
             {t("stages.recipe.gocryptfsBody")}{" "}
             <code>dataset_gocryptfs/run_*</code>{" "}
             {t("stages.recipe.gocryptfsBodyTail")}
+          </div>
+        </button>
+
+        <button
+          type="button"
+          data-testid="pipeline-recipe-scudo"
+          onClick={startScudo}
+          className="md-panel p-4 text-left hover:bg-[var(--md-bg-hover)] transition-colors"
+        >
+          <div className="md-text-accent font-semibold text-sm mb-1">
+            {t("stages.recipe.scudoTitle")}
+          </div>
+          <div className="text-xs md-text-muted">
+            {t("stages.recipe.scudoBody")}
           </div>
         </button>
       </div>

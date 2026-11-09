@@ -222,7 +222,7 @@ All 35 subcommands exposed by [`cli/`](cli/):
 
 Newer subcommands at a glance:
 
-- `search-reduce` — besides a Welford `--state` session, also reduces Android Scudo heap dumps across cold boots: begin a collect session with `consensus-begin --allocator scudo` (or `auto`), feed the runs with `consensus-add`, then `search-reduce --state …` pairs heap chunks across the runs → `candidates.json` (same CLI, same contract)
+- `search-reduce` — besides a Welford `--state` session, also reduces Android Scudo heap dumps across cold boots: begin a collect session with `consensus-begin --allocator scudo` (or `auto`), feed the runs with `consensus-add`, then `search-reduce --state …` pairs heap chunks across the runs → `candidates.json` (same CLI, same contract). The web pipeline offers the same method up to brute-force
 - `consensus-window` — read one window in every dump at the address the consensus aligned
 - `consensus-regions` — list every occurrence of a consensus class, with jump offsets
 - `analyze-candidates` — rank candidate regions across N dumps (no oracle needed)

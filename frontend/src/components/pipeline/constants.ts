@@ -19,6 +19,17 @@ export const ARTIFACT_NAMES = {
   VOL3_YARA_RULE: "vol3_yara_rule",
 } as const;
 
+/**
+ * The stage event carries only verdict names, so their outcome has to be known
+ * here. The strings are the stable ones of `engine/scudo_candidates.py`.
+ */
+export const SCUDO_KEPT_VERDICTS: ReadonlySet<string> = new Set([
+  "signature_unique",
+  "dynamic_residue",
+  "dynamic_candidate",
+]);
+export const SCUDO_NOT_JUDGED_VERDICTS: ReadonlySet<string> = new Set(["missing"]);
+
 /** Names surfaced in primary result tabs; everything else is "Raw". */
 export const PRIMARY_ARTIFACT_NAMES: ReadonlySet<string> = new Set([
   ARTIFACT_NAMES.VOL3_PLUGIN,

@@ -380,3 +380,159 @@ describe("StageThresholds heap policy", () => {
     expect(body.reduce?.heap_policy).toBe("mask");
   });
 });
+
+describe("StageThresholds Android Scudo method", () => {
+  const PRISTINE = usePipelineStore.getState();
+  const PLUGIN_NOTE = /Volatility 3 plugin generation is not supported yet/;
+
+  beforeEach(() => {
+    runPipelineMock.mockReset();
+    runPipelineMock.mockResolvedValue({ task_id: "task-1", status: "pending" });
+    usePipelineStore.setState({
+      ...PRISTINE,
+      stage: "thresholds",
+      form: { ...PRISTINE.form, sourcePaths: DUMPS, oracleId: "oracle-1" },
+    });
+  });
+
+  afterEach(() => {
+    usePipelineStore.setState(PRISTINE, true);
+  });
+
+  async function chooseScudo(): Promise<void> {
+    await renderStage();
+    fireEvent.click(screen.getByTestId("pipeline-method-scudo"));
+  }
+
+  it("starts on the positional method and posts the body it always did", async () => {
+    await renderStage();
+    expect(screen.getByRole("radio", { name: /Positional consensus/ })).toBeChecked();
+    expect(screen.getByTestId("pipeline-heap-policy-select")).toBeInTheDocument();
+
+    const body = await submit();
+    expect(Object.keys(body).sort()).toEqual([
+      "brute_force",
+      "oracle_id",
+      "reduce",
+      "source_paths",
+    ]);
+  });
+
+  it("posts scudo instead of reduce once the method is chosen", async () => {
+    await chooseScudo();
+    const body = await submit();
+
+    expect(body.scudo).toEqual({ allocator: "auto" });
+    expect(Object.keys(body).sort()).toEqual([
+      "brute_force",
+      "oracle_id",
+      "scudo",
+      "source_paths",
+    ]);
+  });
+
+  it("can force the allocator", async () => {
+    await chooseScudo();
+    fireEvent.click(screen.getByTestId("pipeline-scudo-force"));
+    expect((await submit()).scudo).toEqual({ allocator: "scudo" });
+  });
+
+  it("sends the key sizes typed for the secret", async () => {
+    await chooseScudo();
+    fireEvent.change(screen.getByTestId("pipeline-scudo-key-sizes"), {
+      target: { value: "32, 48" },
+    });
+    expect((await submit()).brute_force?.key_sizes).toEqual([32, 48]);
+  });
+
+  it("keeps the last valid key sizes while the field is half typed", async () => {
+    await chooseScudo();
+    fireEvent.change(screen.getByTestId("pipeline-scudo-key-sizes"), {
+      target: { value: "48" },
+    });
+    fireEvent.change(screen.getByTestId("pipeline-scudo-key-sizes"), {
+      target: { value: "" },
+    });
+    expect((await submit()).brute_force?.key_sizes).toEqual([48]);
+  });
+
+  it("hides the variance thresholds, which the method does not use", async () => {
+    await chooseScudo();
+    expect(screen.queryByTestId("pipeline-heap-policy-select")).toBeNull();
+    expect(screen.queryByText("Search-reduce")).toBeNull();
+  });
+
+  it("says the plugin is not supported yet and locks its checkbox", async () => {
+    await chooseScudo();
+    expect(screen.getByTestId("emit-enable")).toBeDisabled();
+    expect(screen.getByTestId("emit-hint")).toHaveTextContent(PLUGIN_NOTE);
+  });
+
+  it("shows no such note on the positional method", async () => {
+    await renderStage();
+    expect(screen.getByTestId("emit-enable")).toBeEnabled();
+    expect(screen.getByTestId("emit-hint")).not.toHaveTextContent(PLUGIN_NOTE);
+  });
+
+  it("locks the N-sweep and says why", async () => {
+    await chooseScudo();
+    expect(screen.getByTestId("nsweep-enable")).toBeDisabled();
+    expect(screen.getByText(/not available with the Android Scudo method/)).toBeInTheDocument();
+  });
+
+  it("drops an already-enabled plugin and sweep when the method is chosen", async () => {
+    usePipelineStore.getState().updateForm({
+      emit: { name: "p" },
+      nsweep: { n_values: [2] },
+    });
+    await chooseScudo();
+
+    const body = await submit();
+    expect(body).not.toHaveProperty("emit");
+    expect(body).not.toHaveProperty("nsweep");
+  });
+
+  it("returns to the positional method with its thresholds intact", async () => {
+    await chooseScudo();
+    fireEvent.click(screen.getByRole("radio", { name: /Positional consensus/ }));
+
+    const body = await submit();
+    expect(body).not.toHaveProperty("scudo");
+    expect(body.reduce).toEqual(PRISTINE.form.reduce);
+  });
+
+  it("does not carry a Scudo key size over to a positional run", async () => {
+    await chooseScudo();
+    fireEvent.change(screen.getByTestId("pipeline-scudo-key-sizes"), {
+      target: { value: "48" },
+    });
+    fireEvent.click(screen.getByRole("radio", { name: /Positional consensus/ }));
+
+    expect(usePipelineStore.getState().form.bruteForce.key_sizes).toEqual([32]);
+    fireEvent.click(screen.getByTestId("pipeline-method-scudo"));
+    expect(screen.getByTestId("pipeline-scudo-key-sizes")).toHaveValue("32");
+  });
+
+  it("shows a server refusal as its sentence, not as JSON", async () => {
+    const { ApiError } = await import("@/api/client");
+    runPipelineMock.mockRejectedValue(
+      new ApiError(
+        400,
+        JSON.stringify({ error: "dump.bin is a raw dump", code: "scudo.not_msl", category: "UNSUPPORTED" }),
+      ),
+    );
+    await chooseScudo();
+    fireEvent.click(screen.getByRole("button", { name: "Run pipeline" }));
+
+    expect(await screen.findByText("dump.bin is a raw dump")).toBeInTheDocument();
+  });
+
+  it("refuses a single dump before asking the server", async () => {
+    usePipelineStore.getState().updateForm({ sourcePaths: [DUMPS[0]] });
+    await chooseScudo();
+    fireEvent.click(screen.getByRole("button", { name: "Run pipeline" }));
+
+    expect(await screen.findByText(/needs at least 2/)).toBeInTheDocument();
+    expect(runPipelineMock).not.toHaveBeenCalled();
+  });
+});

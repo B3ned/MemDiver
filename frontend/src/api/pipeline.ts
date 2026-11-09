@@ -55,6 +55,10 @@ export interface EmitParams {
   variance_threshold?: number | null;
 }
 
+export interface ScudoParams {
+  allocator: "scudo" | "auto";
+}
+
 export interface PipelineRunRequest {
   source_paths: string[];
   // Supply exactly one oracle source: an armed BYO oracle (oracle_id) or a
@@ -74,6 +78,9 @@ export interface PipelineRunRequest {
   brute_force?: BruteForceParams;
   nsweep?: NSweepParams | null;
   emit?: EmitParams | null;
+  // The server refuses this together with `reduce` thresholds, `nsweep` or
+  // `emit`, which all need a positional consensus.
+  scudo?: ScudoParams;
   /** Re-send past the server memory guard (see `@/api/memory-budget`). */
   force_memory?: boolean;
   /** Allow dumps from different experiment cohorts (else refused: `cohort.mixed`). */
@@ -550,7 +557,9 @@ export const runPipeline = (body: PipelineRunRequest) =>
   request<PipelineRunResponse>("/api/pipeline/run", {
     method: "POST",
     // Session region filter (wizard Regions step), unless the body sets one.
-    body: JSON.stringify(withSessionRegionFilter(body)),
+    // Never on a Scudo run: its offsets are in the dump's unfiltered view, so
+    // the server refuses a filter rather than report offsets that do not match.
+    body: JSON.stringify(body.scudo ? body : withSessionRegionFilter(body)),
   });
 
 /**

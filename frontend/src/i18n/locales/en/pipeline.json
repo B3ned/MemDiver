@@ -28,7 +28,9 @@
       "gocryptfsTitle": "Replicate gocryptfs IMF result",
       "gocryptfsBody": "Loads the IMF paper's section 4.2 thresholds (variance ≥ 1500, 8-byte alignment, entropy ≥ 4.5) for the single-N brute-force pass, which stays exhaustive so it reports every hit, plus the published section 7 N-sweep (N = 1,3,5,10,15,20, stride 8), which carries its own settings and stops at the first verified key. Point it at",
       "gocryptfsBodyTail": "and upload the gocryptfs oracle on the next step to reproduce both verified hits.",
-      "saveLoadNote": "Recipe save / load / share is planned for a later release; for now the two presets above cover the IMF demo and the blank starting point."
+      "scudoTitle": "Android Scudo (cold boots)",
+      "scudoBody": "Pair an Android app's heap chunks across cold boots and verify the candidates against an oracle or capture. Needs .msl dumps from at least 2 runs.",
+      "saveLoadNote": "Recipe save / load / share is planned for a later release; for now the presets above cover the blank starting point, the IMF demo and Android Scudo."
     },
     "dumps": {
       "title": "Select memory dumps",
@@ -144,6 +146,21 @@
       "run": "Run pipeline",
       "submitting": "Submitting…",
       "runTitle": "Start consensus → reduce → verify{{optional}}",
+      "scudoRunTitle": "Start Scudo chunk reduction → verify",
+      "scudoNeedsTwoDumps": "The Android Scudo method compares dumps across runs and needs at least 2. Go back to the Dumps step.",
+      "scudoNsweepUnsupported": "The N-sweep harness re-folds a positional consensus, so it is not available with the Android Scudo method.",
+      "method": {
+        "title": "Reduction method",
+        "positional": "Positional consensus",
+        "positionalHint": "Compares the same byte position across dumps. Use it when the layout stays put between runs.",
+        "scudo": "Android Scudo (cold boots)",
+        "scudoHint": "Pairs heap chunks by allocator signature and content instead of by address, because Scudo re-places every chunk on each run. Needs .msl dumps from at least 2 runs. The region filter chosen when opening the dump does not apply here: this method scans the Scudo heap itself.",
+        "allocatorTitle": "Allocator",
+        "allocatorAuto": "Detect on dump 1 and require Scudo",
+        "allocatorForce": "Force Scudo (skip detection)",
+        "keySizes": "key sizes (bytes)",
+        "keySizesHelp": "Comma-separated window sizes brute-force tries. TLS 1.3 traffic secrets are 32 bytes with SHA-256 and 48 with SHA-384."
+      },
       "fields": {
         "minVariance": "min variance",
         "minVarianceHelp": "Per-byte variance threshold. Higher values keep only very volatile bytes; in the IMF paper 1500 separated real crypto material from noise at N≥20.",
@@ -318,6 +335,31 @@
         "verified": "Verified"
       }
     },
+    "scudoFunnel": {
+      "title": "Scudo chunk verdicts",
+      "scope_one": "Every heap chunk of dump 1, compared across {{count}} dump.",
+      "scope_other": "Every heap chunk of dump 1, compared across {{count}} dumps.",
+      "colVerdict": "verdict",
+      "colOutcome": "outcome",
+      "colChunks": "chunks",
+      "colBytes": "bytes",
+      "outcomes": {
+        "kept": "kept",
+        "dropped": "dropped",
+        "notJudged": "not judged"
+      },
+      "verdicts": {
+        "signature_unique": "Unique signature, varies",
+        "dynamic_residue": "Dynamic residue",
+        "dynamic_candidate": "Dynamic candidate",
+        "signature_unique_invariant": "Unique signature, invariant",
+        "content_invariant": "Invariant content",
+        "content_shared": "Content shared with another run",
+        "missing": "Signature missing from a run",
+        "empty": "Empty allocation"
+      },
+      "totals": "{{regions}} regions, {{bytes}}, {{windows}} candidate windows, {{verified}} verified"
+    },
     "log": {
       "title": "Live oracle log",
       "waiting": "Waiting for events…"
@@ -351,8 +393,13 @@
       "coverageLine": "Tested {{tested}} of {{possible}} candidate windows ({{percent}}%) at stride {{stride}}.",
       "coverageExhaustive": "The search was exhaustive: every offset in range was tested.",
       "coveragePartial": "Offsets that are not multiples of {{stride}} were never tested, so a hit count is a lower bound, not a total.",
-      "warningTitle": "Coverage warning"
+      "warningTitle": "Coverage warning",
+      "scudoWarningTitle": "Scudo scan warning",
+      "scudoNoteTitle": "Scudo scan note"
     }
+  },
+  "scudo": {
+    "pluginUnsupported": "Volatility 3 plugin generation is not supported yet with the Android Scudo method. A plugin is built from the per-byte variance around a hit, and this method compares whole heap chunks across runs instead of byte positions, so that data is not available."
   },
   "results": {
     "artifacts": {

@@ -33,6 +33,10 @@ function formatMs(ms: number): string {
 export function StageTimingTable(): JSX.Element {
   const { t } = useTranslation("pipeline");
   const timings = usePipelineStore((s) => s.timings);
+  // A Scudo run builds its chunk consensus inside search-reduce, so a separate
+  // row would only ever read "0 ms".
+  const scudoRun = usePipelineStore((s) => s.form.scudo !== null);
+  const rows = scudoRun ? ROWS.filter((row) => row.key !== "consensus_ms") : ROWS;
   const total =
     timings.consensus_ms + timings.reduce_ms + timings.brute_force_ms;
 
@@ -41,7 +45,7 @@ export function StageTimingTable(): JSX.Element {
       <div className="md-text-accent font-semibold">{t("run.timings.title")}</div>
       <table className="w-full border-collapse">
         <tbody>
-          {ROWS.map((row) => (
+          {rows.map((row) => (
             <tr key={row.key} className="border-b border-[var(--md-border)]">
               <td className="py-1 md-text-muted">{t(row.labelKey)}</td>
               <td className="py-1 text-right font-mono">

@@ -20,7 +20,7 @@ FastAPI backend. Serves the built React bundle at `/` and the Marimo notebook at
 | `/api/consensus` | Incremental Welford consensus sessions. |
 | `/api/algorithms` | `GET /availability` — which algorithms can run, and why not. |
 | `/api/oracles` | BYO-oracle registry: bundled examples (`GET /examples`, `POST /examples/{filename}/load`, `POST /examples/{filename}/suggest-config`), upload / arm / delete, `dry-run` and `smoke-test`, and the oracle-directory switch (`GET /status`, `POST /enable`, `DELETE /orphans`). Upload, example-load and `DELETE /orphans` answer 503 until an oracle directory is enabled — from the UI or pinned by `MEMDIVER_ORACLE_DIR`; see [Directories chosen in the UI](../user_guide/configuration.md#directories-chosen-in-the-ui). |
-| `/api/pipeline` | Phase-25 pipeline orchestration. |
+| `/api/pipeline` | Phase-25 pipeline orchestration. `POST /run` with `scudo: {"allocator": "auto" \| "scudo"}` runs the Android Scudo method instead of the positional consensus: the first source is the reference and the run ends at brute-force. Combined with `emit` it answers 400 `scudo.plugin_unsupported`; combined with `nsweep`, `escalate`, a region filter or `reduce` thresholds, 400 `scudo.unsupported_option`. |
 | `/api/experiment` | SPA experiment runner — spawn target, dump, analyze per tool, verify, emit Volatility3 plugins. |
 | `/api/scan` | Run an emitted YARA rule over dumps (`/yara`), score its firings against known key intervals (`/score`), and run an emitted Volatility3 plugin (`/verify-plugin`). |
 | `/api/settings` | User-chosen server settings persisted in `<memdiver home>/config.json`: `upload-dir` (GET/POST), file-browser `favourites` (GET/POST/DELETE) and `last-dir` (GET/PUT). |

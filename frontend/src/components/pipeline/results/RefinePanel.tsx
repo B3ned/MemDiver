@@ -20,9 +20,12 @@ export function RefinePanel() {
   const loading = usePipelineStore((s) => s.refineLoading);
   const addPoint = usePipelineStore((s) => s.addConvergencePoint);
   const setLoading = usePipelineStore((s) => s.setRefineLoading);
+  const scudoRun = usePipelineStore((s) => s.form.scudo !== null);
   const [paths, setPaths] = useState("");
 
-  if (!taskId || hits.length === 0) return null;
+  // Refine folds more dumps into a positional consensus, which a Scudo run
+  // does not have.
+  if (!taskId || hits.length === 0 || scudoRun) return null;
 
   const handleRefine = async () => {
     const pathList = paths

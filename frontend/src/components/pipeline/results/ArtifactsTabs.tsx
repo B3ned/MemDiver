@@ -86,6 +86,7 @@ export function ArtifactsTabs() {
   const { t } = useTranslation("pipeline");
   const taskId = usePipelineStore((s) => s.taskId);
   const artifacts = usePipelineStore((s) => s.artifacts);
+  const scudoRun = usePipelineStore((s) => s.form.scudo !== null);
   const [tab, setTab] = useState<TabKey>("plugin");
 
   const hasPlugin = useMemo(
@@ -138,8 +139,11 @@ export function ArtifactsTabs() {
           (hasPlugin ? (
             <PluginPreview taskId={taskId} />
           ) : (
-            <div className="md-panel p-4 text-xs md-text-muted">
-              {t("results.artifacts.noPlugin")}
+            <div
+              className="md-panel p-4 text-xs md-text-muted"
+              data-testid="pipeline-no-plugin"
+            >
+              {scudoRun ? t("scudo.pluginUnsupported") : t("results.artifacts.noPlugin")}
             </div>
           ))}
         {tab === "report" &&

@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import tracemalloc
 from pathlib import Path
 
 import numpy as np
@@ -50,6 +51,7 @@ from memdiver.engine.scudo_chunk_consensus import (  # noqa: E402
     _plausible,
     align_chunks,
     build_chunk_consensus,
+    chunk_consensus_estimate,
     class_id_by_size,
     extract_chunks,
 )
@@ -1095,3 +1097,94 @@ def test_dynamic_candidate_vas_and_sizes_are_listed_per_dump(tmp_path):
     # The field round-trips through JSON (it reaches the provenance block).
     import json as _json
     assert _json.loads(_json.dumps(cands)) == cands
+
+
+# ---------------------------------------------------------------------------
+# The per-dump hook and the memory estimate
+# ---------------------------------------------------------------------------
+
+
+def test_the_hook_reports_every_dump_in_order(tmp_path):
+    paths = [str(p) for p in write_neighbour_runs(tmp_path, 3)]
+    seen = []
+
+    build_chunk_consensus(paths, on_dump_scanned=lambda done, total, _chunks: seen.append((done, total)))
+
+    assert seen == [(1, 3), (2, 3), (3, 3)]
+
+
+def test_the_hook_does_not_change_the_consensus(tmp_path):
+    paths = [str(p) for p in write_neighbour_runs(tmp_path, 3)]
+
+    plain = build_chunk_consensus(paths)
+    hooked = build_chunk_consensus(paths, on_dump_scanned=lambda _done, _total, _chunks: None)
+
+    assert plain.signatures == hooked.signatures
+    assert np.array_equal(plain.vector.variance, hooked.vector.variance)
+
+
+def test_an_exception_from_the_hook_stops_the_build_and_closes_the_sources(
+    tmp_path, monkeypatch,
+):
+    from memdiver.core.dump_source import MslDumpSource
+
+    paths = [str(p) for p in write_neighbour_runs(tmp_path, 3)]
+    real_close = MslDumpSource.close
+    closed = []
+
+    def _counting_close(self):
+        closed.append(self)
+        real_close(self)
+
+    monkeypatch.setattr(MslDumpSource, "close", _counting_close)
+    calls = []
+
+    def _cancel(done, _total, _chunks):
+        calls.append(done)
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        build_chunk_consensus(paths, on_dump_scanned=_cancel)
+
+    assert calls == [1]
+    assert len({id(source) for source in closed}) == 3
+
+
+def _small_chunks(count: int, size: int = 16) -> list:
+    return [ScudoChunk(sig=f"scudo:c1:o0:s{size}#{i}", user_va=0x7000_0000_0000 + i * 32,
+                       slot=i, data=os.urandom(size)) for i in range(count)]
+
+
+def test_the_hook_hands_over_each_dumps_chunks(tmp_path):
+    paths = [str(p) for p in write_neighbour_runs(tmp_path, 2)]
+    seen = []
+
+    consensus = build_chunk_consensus(
+        paths, on_dump_scanned=lambda _done, _total, chunks: seen.append(list(chunks)))
+
+    assert seen == consensus.per_dump_chunks
+
+
+def test_the_estimate_extrapolates_one_dump_to_all_of_them():
+    chunks = _small_chunks(100)
+
+    two, four = chunk_consensus_estimate(chunks, 2), chunk_consensus_estimate(chunks, 4)
+
+    assert four.breakdown["chunks"] == 2 * two.breakdown["chunks"]
+    assert four.breakdown["content_masks"] == 2 * two.breakdown["content_masks"]
+    assert four.breakdown["slab"] == two.breakdown["slab"]
+    assert four.peak_bytes == sum(four.breakdown.values())
+
+
+def test_the_estimate_covers_what_a_heap_of_small_chunks_really_holds():
+    """Such a heap costs several times its own bytes in Python objects."""
+    tracemalloc.start()
+    try:
+        before = tracemalloc.get_traced_memory()[0]
+        chunks = _small_chunks(20_000)
+        held = tracemalloc.get_traced_memory()[0] - before
+    finally:
+        tracemalloc.stop()
+
+    assert chunk_consensus_estimate(chunks, 1).breakdown["chunks"] >= held
+    assert held > 5 * sum(len(chunk.data) for chunk in chunks)

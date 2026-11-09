@@ -325,3 +325,21 @@ def test_chunk_default_page_size_alignment():
 def test_chunk_invalid_args(n, bpp):
     with pytest.raises(ValueError):
         adaptive_chunk_positions(n, bpp, GIB)
+
+
+def test_check_budget_recommends_the_region_filter_by_default():
+    from memdiver.core.memory_budget import MemoryEstimate, check_budget
+    from memdiver.core.service_errors import CapabilityError
+
+    with pytest.raises(CapabilityError) as refused:
+        check_budget(MemoryEstimate(100, "op"), budget=1)
+    assert "apply a region filter" in refused.value.message
+
+
+def test_check_budget_takes_the_suggestions_of_a_route_without_a_filter():
+    from memdiver.core.memory_budget import MemoryEstimate, check_budget
+    from memdiver.core.service_errors import CapabilityError
+
+    with pytest.raises(CapabilityError) as refused:
+        check_budget(MemoryEstimate(100, "op"), budget=1, suggestions="use fewer dumps.")
+    assert refused.value.message.endswith("Suggestions: use fewer dumps.")

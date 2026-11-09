@@ -116,6 +116,16 @@ The positive control uses the dataset's recorded answer key, so it proves the or
 Stages: `consensus` → `search_reduce` → `brute_force`, then the optional `escalate`, `nsweep`, and `emit_plugin`. The **Reduction funnel** shows candidates surviving each step (Raw → Variance → Aligned → Entropy → Candidates → Verified); the live log streams oracle hits, and **Verified hits** rows offer **Open in hex**.
 ```
 
+### Android Scudo heaps across cold boots
+
+After an Android cold boot Scudo has placed every heap chunk somewhere else, so the positional consensus compares unrelated bytes. Pick the **Android Scudo (cold boots)** recipe, or set **Reduction method** on the Thresholds step, to run the same chunk-consensus reduction as the [CLI](../quickstart/cli.md#android-scudo-heaps-across-cold-boots). It needs `.msl` dumps from at least two runs, and dump 1 is the reference, so the oracle or capture must belong to that run.
+
+- **Allocator**: *Detect on dump 1* refuses a dump whose heap is not recognised as Scudo; *Force Scudo* skips that check.
+- **Key sizes**: the window sizes brute-force tries, for example `48` for a SHA-384 TLS 1.3 traffic secret.
+- **Scudo chunk verdicts** replaces the funnel: every chunk of the reference gets one verdict and counts as kept, dropped or *not judged*. A chunk whose signature is absent from another run was never compared, so it is not judged rather than ruled out. Warnings about the scan appear below the table.
+
+The method stops at brute-force. **Volatility 3 plugin generation is not supported yet with it**, because a plugin is built from the per-byte variance around a hit and this method compares whole chunks across runs instead of byte positions. The N-sweep, escalation and Refine need the positional consensus for the same reason.
+
 ## Pipeline — results
 
 ```{figure} /_static/screenshots/10_pipeline_results.png

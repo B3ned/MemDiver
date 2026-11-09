@@ -168,6 +168,29 @@ export interface EmitPluginStageEndExtra {
   fields?: InferredField[];
 }
 
+export const SCUDO_REDUCE_SOURCE = "search-reduce:scudo";
+
+/**
+ * A partition of the reference's heap chunks rather than a filter chain, which
+ * is why it has its own view instead of the positional funnel's bars.
+ */
+export interface ScudoReduceSummary {
+  source: typeof SCUDO_REDUCE_SOURCE;
+  num_regions: number;
+  num_dumps: number;
+  reference_dump: string;
+  funnel: Record<string, { chunks: number; bytes: number }>;
+  totals: {
+    regions: number;
+    bytes: number;
+    key_sizes: number[];
+    stride: number;
+    windows: number;
+  };
+  not_judged: { chunks: number; bytes: number };
+  diagnostics: StageDiagnostic[];
+}
+
 /** `nsweep_point`: one (N, counts) sample from an n-sweep run. */
 export interface NSweepPointExtra {
   n?: number;
@@ -231,6 +254,12 @@ export interface EmitPluginStageEndEvent extends ProgressEventBase {
   extra?: EmitPluginStageEndExtra | null;
 }
 
+export interface ScudoReduceStageEndEvent extends ProgressEventBase {
+  type: "stage_end";
+  stage: "search_reduce";
+  extra: ScudoReduceSummary;
+}
+
 /** `stage_end` for any other stage (e.g. "reduce"): no typed extra. */
 export interface GenericStageEndEvent extends ProgressEventBase {
   type: "stage_end";
@@ -242,6 +271,7 @@ export type StageEndEvent =
   | BruteForceStageEndEvent
   | ConsensusStageEndEvent
   | EmitPluginStageEndEvent
+  | ScudoReduceStageEndEvent
   | GenericStageEndEvent;
 
 export interface FunnelEvent extends ProgressEventBase {
@@ -320,6 +350,16 @@ export function isEmitPluginStageEnd(
   event: TaskProgressEvent,
 ): event is EmitPluginStageEndEvent {
   return event.type === "stage_end" && event.stage === "emit_plugin";
+}
+
+export function isScudoReduceStageEnd(
+  event: TaskProgressEvent,
+): event is ScudoReduceStageEndEvent {
+  return (
+    event.type === "stage_end" &&
+    event.stage === "search_reduce" &&
+    event.extra?.source === SCUDO_REDUCE_SOURCE
+  );
 }
 
 // ---- runtime validation boundary -------------------------------------------

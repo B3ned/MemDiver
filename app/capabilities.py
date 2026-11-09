@@ -156,10 +156,11 @@ CAPABILITIES: Tuple[Capability, ...] = (
     _cap("pipeline.search_reduce", "memdiver.app.tools_pipeline.search_reduce",
          ("library", "cli", "web", "mcp")),
     # Android Scudo heaps across cold boots: the chunk-signature reduction behind
-    # `search-reduce` on a Scudo session. Not on web or MCP yet (KNOWN_PARITY_GAPS).
+    # `search-reduce` on a Scudo session and behind a web pipeline run with `scudo`
+    # params. Not on MCP yet (KNOWN_PARITY_GAPS).
     _cap("pipeline.search_reduce_android",
          "memdiver.app.tools_pipeline_android.search_reduce_android",
-         ("library", "cli")),
+         ("library", "cli", "web")),
     _cap("pipeline.brute_force", "memdiver.app.tools_pipeline.brute_force",
          ("library", "cli", "web", "mcp")),
     _cap("pipeline.n_sweep", "memdiver.app.tools_pipeline.n_sweep",
@@ -530,8 +531,8 @@ CAPABILITIES: Tuple[Capability, ...] = (
 #:     and the `/auto-export` route both route through the producer.
 #:   * dataset scan / list_* / analyze have CLI implementations that do not
 #:     route through the app producer.
-#:   * pipeline.search_reduce_android shipped CLI-first: the web pipeline and an
-#:     MCP tool still have to route to the producer.
+#:   * pipeline.search_reduce_android has no MCP tool yet that routes to the
+#:     producer.
 KNOWN_PARITY_GAPS: FrozenSet[Tuple[str, str]] = frozenset({
     ("inspect.hex_raw", "cli"),
     ("inspect.resolve_va", "cli"),
@@ -553,7 +554,6 @@ KNOWN_PARITY_GAPS: FrozenSet[Tuple[str, str]] = frozenset({
     ("analysis.infer_fields", "mcp"),
     ("analysis.algorithm_availability", "cli"),
     ("analysis.algorithm_availability", "mcp"),
-    ("pipeline.search_reduce_android", "web"),
     ("pipeline.search_reduce_android", "mcp"),
 })
 

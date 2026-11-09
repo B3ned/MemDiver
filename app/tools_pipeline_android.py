@@ -13,8 +13,8 @@ chunks as ``candidates.json`` in the reference's flat ``"vas"`` view: the
 coordinates ``brute-force --dump <reference>`` slices its windows from.
 
 The ``search-reduce`` command reaches it through the kind of its ``--state``
-session; it is registered as ``pipeline.search_reduce_android`` in
-:mod:`memdiver.app.capabilities`.
+session and the web pipeline through a run's ``scudo`` params; it is registered
+as ``pipeline.search_reduce_android`` in :mod:`memdiver.app.capabilities`.
 
 The chain it completes::
 
@@ -55,6 +55,7 @@ from memdiver.core.service_errors import (
 )
 from memdiver.core.service_result import Diagnostic, Severity
 
+from ._progress import _emit, _experiment_check_cancelled
 from .key_material import has_key_material, key_material_kwargs
 from .tools_consensus import _single_cohort
 from .tools_pipeline import _dump_json, _ensure_dir
@@ -75,7 +76,9 @@ __all__ = [
     "REFERENCE_NOT_IN_DUMPS_CODE",
     "REFERENCE_TRUNCATED_CODE",
     "SCOPE_FALLBACK_CODE",
+    "SCUDO_SOURCE",
     "TOO_FEW_DUMPS_CODE",
+    "UNSUPPORTED_OPTION_CODE",
     "WRONG_ALLOCATOR_CODE",
 ]
 
@@ -85,7 +88,7 @@ CANDIDATES_FILENAME = "candidates.json"
 
 #: ``source`` stamped into the artifact, so a reader can tell a Scudo-mode
 #: ``search-reduce`` output from a positional (Welford) ``search-reduce`` one.
-_SOURCE = "search-reduce:scudo"
+SCUDO_SOURCE = "search-reduce:scudo"
 
 # Refusals (CapabilityError.code) and diagnostics (Diagnostic.code). Stable
 # strings in the ``scudo.`` namespace.
@@ -104,7 +107,10 @@ SCOPE_FALLBACK_CODE = "scudo.scope_fallback"
 #: allocator, or ``auto`` detected one): a Scudo session reduces Scudo heaps only.
 WRONG_ALLOCATOR_CODE = "scudo.wrong_allocator"
 PLUGIN_UNSUPPORTED_CODE = "scudo.plugin_unsupported"
+UNSUPPORTED_OPTION_CODE = "scudo.unsupported_option"
 
+#: The web UI repeats this sentence from its locale file, because its form has
+#: to say so before any request.
 PLUGIN_UNSUPPORTED_MESSAGE = (
     "Volatility 3 plugin generation is not supported yet with the Android "
     "Scudo method. A plugin is built from the per-byte variance around a hit, "
@@ -116,6 +122,12 @@ PLUGIN_UNSUPPORTED_MESSAGE = (
 _NEW_SESSION_HINT = (
     "begin a session with consensus-begin --size for the generic (Welford) "
     "pipeline, or with consensus-begin --allocator scudo to force the Scudo path"
+)
+
+#: No region filter among these: a Scudo run refuses one.
+_BUDGET_SUGGESTIONS = (
+    "use fewer dumps, raise MEMDIVER_MEMORY_BUDGET_MB / max_rss_mb, or pass "
+    "force to override."
 )
 
 #: Why a kept chunk did not become a region. Each is a translation guard that
@@ -196,6 +208,30 @@ def _reference_index(paths: Sequence[str], reference_path: str) -> int:
         f"reference dump is not one of the named dumps: {reference_path}; "
         "the reference must be part of the consensus it is reduced against",
         code=REFERENCE_NOT_IN_DUMPS_CODE)
+
+
+def _validate_scudo_dumps(
+    dump_paths: Sequence[str],
+    reference_path: str,
+    key_sizes: Sequence[int],
+    mixed_ok: bool = False,
+) -> Tuple[Tuple[int, ...], int, Optional[str]]:
+    """Every refusal that needs no heap read, as ``(sizes, ref_index, cohort)``.
+
+    Shared by the producer and the web router: the web answers a bad request
+    before it starts a worker, and both give the same refusal codes.
+
+    :raises CapabilityError: on the refusals named in the module docstring.
+    """
+    paths = [str(p) for p in dump_paths]
+    if len(paths) < 2:
+        raise CapabilityError(
+            f"Need at least 2 dumps to build a consensus, got {len(paths)}",
+            category=ErrorCategory.INVALID_INPUT, code=TOO_FEW_DUMPS_CODE)
+    sizes = _validated_key_sizes(key_sizes)
+    _require_distinct_msl_files(paths)
+    ref_index = _reference_index(paths, reference_path)
+    return sizes, ref_index, _single_cohort(paths, mixed_ok)
 
 
 def _refuse_truncated(source: Any, reference_path: str) -> None:
@@ -388,6 +424,31 @@ def _diagnostics(
     return [d.to_dict() for d in out]
 
 
+def _stage_end_extra(summary: Dict[str, Any]) -> Dict[str, Any]:
+    """The summary a live surface needs, without its unbounded detail.
+
+    Stage events sit in a bounded replay ring and cross a process queue, while a
+    real app's not-judged signature list runs to thousands of entries.
+    """
+    not_judged = summary["not_judged"]
+    return {
+        "source": summary["source"],
+        "num_regions": summary["totals"]["regions"],
+        "funnel": summary["funnel"],
+        "totals": summary["totals"],
+        "skipped": summary["skipped"],
+        "consensus": summary["consensus"],
+        "region_scope": summary["region_scope"],
+        "reference_dump": summary["reference_dump"],
+        "num_dumps": summary["N"],
+        "not_judged": {"chunks": not_judged["chunks"], "bytes": not_judged["bytes"]},
+        "diagnostics": [
+            {k: v for k, v in diagnostic.items() if k != "details"}
+            for diagnostic in summary["diagnostics"]
+        ],
+    }
+
+
 # --------------------------------------------------------------------------
 # The producer
 # --------------------------------------------------------------------------
@@ -405,10 +466,13 @@ def search_reduce_android(
     allocator: str = "auto",
     mixed_ok: bool = False,
     on_source: Optional[Callable[[Any], None]] = None,
+    on_progress: Optional[Callable[..., None]] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
+    force_memory: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Reduce N Android Scudo dumps to ``brute-force`` candidates of one reference.
 
-    Backs the ``search-reduce`` command's Scudo mode.
+    Backs the ``search-reduce`` command's Scudo mode and a web pipeline Scudo run.
 
     Builds the chunk-signature consensus over ``dump_paths`` (content alignment
     on), classifies every Scudo primary chunk of ``reference_path`` and writes
@@ -429,6 +493,15 @@ def search_reduce_android(
     lifts the ``cohort.mixed`` refusal. ``on_source`` is invoked on the opened
     reference (the CLI reports AEAD tag status through it).
 
+    ``on_progress`` / ``is_cancelled`` are the same optional surface hooks the
+    other pipeline producers take: the ``search_reduce`` stage stream, with
+    sub-stages ``chunk_consensus`` / ``classify`` / ``regions``, and cooperative
+    cancellation. Unset, the artifact and the return value do not change.
+
+    ``force_memory`` gates the build on the memory budget: ``None`` (the CLI)
+    applies no gate, ``False`` refuses an over-budget build with
+    ``memory_budget_exceeded``, ``True`` proceeds with a warning.
+
     Returns the run summary (no region list -- that is the artifact):
     ``candidates_path``, ``num_regions``, ``totals``, ``funnel``,
     ``not_judged``, ``skipped``, ``diagnostics``, ``consensus``,
@@ -439,6 +512,7 @@ def search_reduce_android(
         locked dump.
     """
     from memdiver.core.dump_source import open_dump
+    from memdiver.core.memory_budget import check_budget
     from memdiver.engine.scudo_candidates import (
         SCUDO_CANDIDATES_VERSION,
         VERDICT_MISSING,
@@ -450,27 +524,48 @@ def search_reduce_android(
         CHUNK_CONSENSUS_VERSION,
         SCOPE_ALL_RW,
         build_chunk_consensus,
+        chunk_consensus_estimate,
     )
 
     paths = [str(p) for p in dump_paths]
-    if len(paths) < 2:
-        raise CapabilityError(
-            f"Need at least 2 dumps to build a consensus, got {len(paths)}",
-            category=ErrorCategory.INVALID_INPUT, code=TOO_FEW_DUMPS_CODE)
-    sizes = _validated_key_sizes(key_sizes)
-    _require_distinct_msl_files(paths)
-    ref_index = _reference_index(paths, reference_path)
-    cohort = _single_cohort(paths, mixed_ok)
+    sizes, ref_index, cohort = _validate_scudo_dumps(
+        paths, reference_path, key_sizes, mixed_ok)
     km = key_material_kwargs(key_file, passphrase, kem_key_file)
+    key_material = km if has_key_material(km) else None
+
+    def _check_cancelled() -> None:
+        _experiment_check_cancelled(is_cancelled, on_progress)
+
+    def _progress(sub_stage: str, pct: float, msg: str) -> None:
+        _emit(on_progress, "progress", stage=f"search_reduce:{sub_stage}",
+              pct=pct, msg=msg)
+
+    def _on_dump_scanned(done: int, total: int, chunks: Sequence[Any]) -> None:
+        _check_cancelled()
+        # After one dump: real chunk counts exist, and most of the peak does not.
+        if done == 1 and force_memory is not None:
+            check_budget(chunk_consensus_estimate(chunks, total), force=force_memory,
+                         suggestions=_BUDGET_SUGGESTIONS)
+        # The scan is the slow part, so it gets most of the stage's bar.
+        _progress("chunk_consensus", 0.8 * done / total,
+                  f"scanned Scudo chunks of dump {done}/{total}")
+
+    _emit(on_progress, "stage_start", stage="search_reduce", pct=0.0,
+          msg=f"Scudo chunk consensus over {len(paths)} dumps")
+    _check_cancelled()
     _require_scudo(reference_path, allocator, km)
 
     scc = build_chunk_consensus(
-        paths, key_material=km if has_key_material(km) else None,
-        content_alignment=True)
+        paths, key_material=key_material, content_alignment=True,
+        on_dump_scanned=_on_dump_scanned)
+    _check_cancelled()
+    _progress("classify", 0.85, "classifying the reference's chunks")
     verdicts = classify_chunks(scc, ref_index)
     funnel = verdict_funnel(verdicts)
     kept = sorted((v for v in verdicts if v.kept), key=lambda v: v.va)
 
+    _check_cancelled()
+    _progress("regions", 0.9, f"verifying {len(kept)} kept chunk(s)")
     with open_dump(Path(reference_path), **km) as source:
         if on_source is not None:
             on_source(source)
@@ -506,7 +601,7 @@ def search_reduce_android(
         "empty_signatures": len(scc.empty),
     }
     summary = {
-        "source": _SOURCE,
+        "source": SCUDO_SOURCE,
         "version": SCUDO_CANDIDATES_VERSION,
         "consensus": consensus,
         "N": len(paths),
@@ -527,6 +622,8 @@ def search_reduce_android(
     _dump_json({**summary, "regions": regions}, candidates_path)
     logger.info("search-reduce[scudo]: %d region(s), %d bytes, %d window(s) -> %s",
                 totals["regions"], totals["bytes"], totals["windows"], candidates_path)
+    _emit(on_progress, "stage_end", stage="search_reduce", pct=1.0,
+          msg=f"{len(regions)} regions", extra=_stage_end_extra(summary))
     return {
         **summary,
         "candidates_path": str(candidates_path),

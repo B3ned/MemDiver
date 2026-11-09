@@ -178,3 +178,17 @@ def test_register_stage_twice_is_idempotent():
         dup_stages = [s for s in pr.get_pipeline_stages() if s.name == "dup"]
         pr._execute_stages(_make_state(), dup_stages)
         assert calls == ["second"]
+
+
+def test_a_scudo_run_only_turns_off_the_consensus_stage():
+    """The stage stays registered, so positions relative to it keep working."""
+    stages = {s.name: s for s in pr.get_pipeline_stages()}
+    state = _make_state()
+    assert stages["consensus"].enabled(state) is True
+
+    state.scudo_params = {"allocator": "auto"}
+
+    assert stages["consensus"].enabled(state) is False
+    assert stages["search_reduce"].enabled(state) is True
+    assert stages["brute_force"].enabled(state) is True
+    assert [s.name for s in pr.get_pipeline_stages()] == _EXPECTED_DEFAULT_ORDER

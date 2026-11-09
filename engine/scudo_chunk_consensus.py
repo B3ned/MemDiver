@@ -85,10 +85,11 @@ import logging
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
+from memdiver.core.memory_budget import MemoryEstimate
 from memdiver.core.region_align import (
     AlignedSlice,
     AlignmentCoverage,
@@ -126,6 +127,7 @@ __all__ = [
     "extract_chunks",
     "align_chunks",
     "build_chunk_consensus",
+    "chunk_consensus_estimate",
 ]
 
 PathLike = Union[str, Path]
@@ -1064,12 +1066,44 @@ def _assemble_vector(
     return cm, rows
 
 
+#: What one kept ``ScudoChunk`` costs beyond its user bytes: 273 measured on
+#: CPython 3.14, with room for the larger instance dicts of older interpreters.
+_CHUNK_OBJECT_BYTES = 320
+#: The same for its ``_MaskedChunk``, which lives through content alignment.
+_MASKED_OBJECT_BYTES = 250
+#: A paired user byte costs a float32 variance, the reference bytes twice
+#: (bytearray, then bytes) and a classification byte.
+_SLAB_BYTES_PER_USER_BYTE = 7
+
+
+def chunk_consensus_estimate(
+    first_dump_chunks: Sequence[ScudoChunk], num_dumps: int,
+) -> MemoryEstimate:
+    """Peak memory of a build, extrapolated from its first scanned dump.
+
+    The cost of a Scudo heap follows its chunk count, not its size: a heap of
+    32-byte blocks costs several times its own bytes in Python objects, and only
+    a scan can tell how many chunks there are. Runs of one app allocate alike,
+    so one real dump is a sound basis, but this stays an extrapolation.
+    """
+    user_bytes = sum(len(chunk.data) for chunk in first_dump_chunks)
+    chunks = len(first_dump_chunks)
+    breakdown = {
+        "chunks": num_dumps * (user_bytes + chunks * _CHUNK_OBJECT_BYTES),
+        "content_masks": num_dumps * (user_bytes + chunks * _MASKED_OBJECT_BYTES),
+        "slab": user_bytes * _SLAB_BYTES_PER_USER_BYTE,
+    }
+    return MemoryEstimate(
+        sum(breakdown.values()), f"Scudo chunk consensus ({num_dumps} dumps)", breakdown)
+
+
 def build_chunk_consensus(
     dump_paths: Sequence[PathLike],
     *,
     key_material: Optional[Mapping[str, Any]] = None,
     thresholds: Optional[VarianceThresholds] = None,
     content_alignment: bool = True,
+    on_dump_scanned: Optional[Callable[[int, int, Sequence[ScudoChunk]], None]] = None,
 ) -> ScudoChunkConsensus:
     """Open the dumps, extract + align Scudo chunks, build the consensus.
 
@@ -1094,6 +1128,11 @@ def build_chunk_consensus(
         signature by pointer-masked content, pairing the groups that line up one
         per dump (:func:`_content_align`). Signature-unique pairings are
         untouched either way; ``False`` pairs by header signature alone.
+    :param on_dump_scanned: Optional ``(done, total, chunks)`` hook called after
+        each dump's chunks are extracted, the one slow, per-dump step here. It
+        is how a caller reports progress, cancels and gates memory on real
+        chunk counts: an exception it raises propagates, and the sources are
+        closed on the way out.
     """
     from memdiver.engine.consensus_service import open_consensus_sources
 
@@ -1108,7 +1147,7 @@ def build_chunk_consensus(
         per_dump: List[List[ScudoChunk]] = []
         per_scopes: List[ScudoScanScope] = []
         per_ranges: List[Tuple[np.ndarray, np.ndarray, str]] = []
-        for src in sources:
+        for done, src in enumerate(sources, start=1):
             reader = src.get_reader()
             regions, chunks, scope = extract_chunks(reader)
             per_regions.append(regions)
@@ -1116,6 +1155,8 @@ def build_chunk_consensus(
             per_scopes.append(scope)
             if content_alignment:
                 per_ranges.append(_pointer_ranges(reader))
+            if on_dump_scanned is not None:
+                on_dump_scanned(done, len(sources), chunks)
 
     unique_slices, ambiguous, missing = align_chunks(per_dump)
     seen = {c.sig for chunks in per_dump for c in chunks}

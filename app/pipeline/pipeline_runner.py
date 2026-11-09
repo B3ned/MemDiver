@@ -422,6 +422,47 @@ def _run_reduce(
     return candidates_path
 
 
+def _run_reduce_scudo(
+    source_paths: Sequence[str],
+    scudo_params: Dict[str, Any],
+    *,
+    key_sizes: Sequence[int],
+    mixed_ok: bool,
+    force_memory: bool,
+    ctx,
+    artifact_dir: Path,
+    artifacts: List[Dict[str, Any]],
+) -> Path:
+    """Run the Android Scudo reduction and persist the resulting candidates.json.
+
+    Scudo alignment needs every dump at once, so the chunk consensus is built
+    here and not in a consensus stage. The artifact keeps the positional stage's
+    name and path because it is the same contract for ``brute_force``.
+    """
+    from memdiver.app.tools_pipeline_android import search_reduce_android
+
+    out_dir = artifact_dir / "search_reduce"
+    _run_producer(
+        search_reduce_android,
+        dump_paths=list(source_paths),
+        reference_path=source_paths[0],
+        output_dir=str(out_dir),
+        key_sizes=key_sizes,
+        allocator=scudo_params["allocator"],
+        mixed_ok=mixed_ok,
+        force_memory=force_memory,
+        on_progress=_producer_sink(ctx),
+        is_cancelled=ctx.is_cancelled,
+    )
+    register_artifact(
+        artifacts, artifact_dir,
+        name="candidates",
+        relpath="search_reduce/candidates.json",
+        media_type="application/json",
+    )
+    return out_dir / "candidates.json"
+
+
 def _run_brute_force(
     candidates_path: Path,
     reference_path: Path,
@@ -802,6 +843,9 @@ class PipelineState:
     # Cohort-mix override (params key ``mixed_ok``) forwarded to the consensus
     # and n-sweep stages; unset, a multi-cohort source set is refused.
     mixed_ok: bool = False
+    # The router refuses every option the Scudo method cannot honour, so the
+    # stages below only branch on reduce and verify.
+    scudo_params: Optional[Dict[str, Any]] = None
     artifacts: List[Dict[str, Any]] = field(default_factory=list)
     summary: Dict[str, Any] = field(default_factory=dict)
     # Opt-in escalation (floor-free fall-through when brute-force finds no hit).
@@ -815,6 +859,15 @@ class PipelineState:
 
 def _always_enabled(state: "PipelineState") -> bool:
     return True
+
+
+def _consensus_enabled(state: "PipelineState") -> bool:
+    """Off for a Scudo run, whose chunk consensus is part of ``search_reduce``.
+
+    A positional fold of cold-boot dumps would line up unrelated bytes, and it
+    would cost a full read of every dump for nothing the Scudo path consumes.
+    """
+    return state.scudo_params is None
 
 
 def _nsweep_enabled(state: "PipelineState") -> bool:
@@ -902,24 +955,42 @@ def _stage_consensus(state: "PipelineState") -> None:
 
 
 def _stage_reduce(state: "PipelineState") -> None:
-    consensus = state.consensus
-    state.candidates_path = _run_reduce(
-        Path(consensus["variance_path"]),
-        Path(consensus["reference_path"]),
-        consensus["num_dumps"],
-        state.reduce_kwargs,
-        ctx=state.ctx,
-        artifact_dir=state.artifact_dir,
-        artifacts=state.artifacts,
-    )
+    if state.scudo_params is not None:
+        state.candidates_path = _run_reduce_scudo(
+            state.source_paths,
+            state.scudo_params,
+            key_sizes=state.bf_kwargs.get("key_sizes", (32,)),
+            mixed_ok=state.mixed_ok,
+            force_memory=state.force_memory,
+            ctx=state.ctx,
+            artifact_dir=state.artifact_dir,
+            artifacts=state.artifacts,
+        )
+    else:
+        consensus = state.consensus
+        state.candidates_path = _run_reduce(
+            Path(consensus["variance_path"]),
+            Path(consensus["reference_path"]),
+            consensus["num_dumps"],
+            state.reduce_kwargs,
+            ctx=state.ctx,
+            artifact_dir=state.artifact_dir,
+            artifacts=state.artifacts,
+        )
     state.summary["candidates_path"] = str(state.candidates_path)
 
 
 def _stage_brute_force(state: "PipelineState") -> None:
-    consensus = state.consensus
+    # A Scudo run's offsets are in the first dump's own flat view and it has no
+    # Welford state, so its hits carry no neighborhood variance.
+    if state.scudo_params is not None:
+        reference_path, consensus_state = Path(state.source_paths[0]), None
+    else:
+        reference_path = Path(state.consensus["reference_path"])
+        consensus_state = Path(state.consensus["state_path"])
     state.hits_path = _run_brute_force(
         state.candidates_path,
-        Path(consensus["reference_path"]),
+        reference_path,
         state.oracle_path,
         state.bf_kwargs,
         oracle_config=state.oracle_config,
@@ -927,7 +998,7 @@ def _stage_brute_force(state: "PipelineState") -> None:
         tls_client_random=state.tls_client_random,
         pcap_max_records=state.pcap_max_records,
         pcap_max_challenges=state.pcap_max_challenges,
-        state_path=Path(consensus["state_path"]),
+        state_path=consensus_state,
         variance_threshold=state.variance_threshold,
         ctx=state.ctx,
         artifact_dir=state.artifact_dir,
@@ -1043,7 +1114,8 @@ def _stage_escalate(state: "PipelineState") -> None:
 def _default_stages() -> List[Stage]:
     """Build a fresh list of the default stages in canonical order."""
     return [
-        Stage("consensus", _stage_consensus, check_cancel_before=False),
+        Stage("consensus", _stage_consensus, enabled=_consensus_enabled,
+              check_cancel_before=False),
         Stage("search_reduce", _stage_reduce),
         Stage("brute_force", _stage_brute_force),
         Stage("escalate", _stage_escalate, enabled=_escalate_enabled),
@@ -1199,6 +1271,8 @@ def run_pipeline(params: Dict[str, Any], ctx) -> Dict[str, Any]:
       memory-budget guard (forwarded to the consensus stage as ``force=``).
       Without it an over-budget fold raises ``CapabilityError``
       ``code="memory_budget_exceeded"``, which propagates unchanged.
+    * ``scudo`` (dict, optional): ``allocator`` (``"scudo"`` or ``"auto"``)
+      selects the Android Scudo method instead of the positional consensus.
 
     Returns a dict with:
 
@@ -1267,6 +1341,7 @@ def run_pipeline(params: Dict[str, Any], ctx) -> Dict[str, Any]:
         region_filter=params.get("region_filter"),
         force_memory=bool(params.get("force_memory", False)),
         mixed_ok=bool(params.get("mixed_ok", False)),
+        scudo_params=params.get("scudo"),
         reduce_kwargs=reduce_kwargs,
         oracle_path=oracle_path,
         oracle_config=oracle_config,

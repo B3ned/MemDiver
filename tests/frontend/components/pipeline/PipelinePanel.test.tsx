@@ -114,3 +114,58 @@ describe("PipelinePanel mid-run resume", { timeout: 20_000 }, () => {
     expect(usePipelineStore.getState().lastSeq).toBe(12);
   });
 });
+
+describe("PipelinePanel results of an Android Scudo run", { timeout: 20_000 }, () => {
+  const PRISTINE = usePipelineStore.getState();
+  const FINISHED_RECORD: TaskRecord = {
+    ...RUNNING_RECORD,
+    status: "succeeded",
+    stages: [],
+    ended_at: 1001,
+  };
+
+  beforeEach(() => {
+    getPipelineRunMock.mockReset();
+    getPipelineRunMock.mockResolvedValue(FINISHED_RECORD);
+  });
+
+  afterEach(() => {
+    usePipelineStore.setState(PRISTINE, true);
+  });
+
+  it("keeps the verdict table on screen once the run is over", async () => {
+    usePipelineStore.setState({
+      ...PRISTINE,
+      stage: "results",
+      taskId: "task-42",
+      status: "succeeded",
+      scudoSummary: {
+        source: "search-reduce:scudo",
+        num_regions: 0,
+        num_dumps: 2,
+        reference_dump: "/d/a.msl",
+        funnel: { content_shared: { chunks: 9, bytes: 90 } },
+        totals: { regions: 0, bytes: 0, key_sizes: [32], stride: 1, windows: 0 },
+        not_judged: { chunks: 0, bytes: 0 },
+        diagnostics: [],
+      },
+    });
+    const { default: PipelinePanel } = await import("@/components/pipeline/PipelinePanel");
+    render(<PipelinePanel />);
+    expect(await screen.findByTestId("pipeline-scudo-funnel")).toBeInTheDocument();
+  });
+
+  it("adds no funnel to a positional run's results", async () => {
+    usePipelineStore.setState({
+      ...PRISTINE,
+      stage: "results",
+      taskId: "task-42",
+      status: "succeeded",
+    });
+    const { default: PipelinePanel } = await import("@/components/pipeline/PipelinePanel");
+    render(<PipelinePanel />);
+    await waitFor(() => expect(getPipelineRunMock).toHaveBeenCalled());
+    expect(screen.queryByText("Reduction funnel")).toBeNull();
+    expect(screen.queryByTestId("pipeline-scudo-funnel")).toBeNull();
+  });
+});

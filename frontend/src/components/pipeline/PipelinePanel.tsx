@@ -20,6 +20,7 @@ import { useTranslation } from "react-i18next";
 import { cancelPipelineRun, getPipelineRun } from "@/api/pipeline";
 import { useFtueStore } from "@/ftue/store";
 import { useTaskProgress } from "@/hooks/useTaskProgress";
+import { FunnelChart } from "@/components/pipeline/run/FunnelChart";
 import { HitsList, PipelineRunDashboard, RunDiagnostics } from "@/components/pipeline/run/PipelineRunDashboard";
 import { ArtifactsTabs } from "@/components/pipeline/results/ArtifactsTabs";
 import { RefinePanel } from "@/components/pipeline/results/RefinePanel";
@@ -189,8 +190,15 @@ function ResumingBanner() {
 }
 
 function ResultsView() {
+  const scudoRan = usePipelineStore((s) => s.scudoSummary !== null);
   return (
     <div className="p-4 space-y-4">
+      {/*
+       * The verdicts say why a Scudo run searched what it searched. They would
+       * otherwise leave the screen with the run dashboard, which is exactly
+       * when a zero-hit run needs them.
+       */}
+      {scudoRan && <FunnelChart />}
       {/*
        * The verified hits are the run's headline result -- a key proven against
        * a real capture shows here as "Verified via pcap capture". `HitsList`

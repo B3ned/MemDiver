@@ -27,6 +27,8 @@ stage = Stage(
   Read what you need (`state.consensus`, `state.candidates_path`,
   `state.hits_path`, parsed params like `state.oracle_path`) and write your
   outputs back (`state.summary[...]`, plus any field later stages consume).
+  `state.consensus` is `None` on an Android Scudo run (`state.scudo_params` is
+  set), which builds no positional consensus and has no `variance.npy`.
 - **`enabled(state)`** decides whether the stage runs at all. This is where
   optional stages gate themselves (e.g. the built-in `nsweep` stage is enabled
   only when `state.nsweep_params is not None`).

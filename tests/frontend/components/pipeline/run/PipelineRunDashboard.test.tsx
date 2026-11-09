@@ -1,9 +1,10 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { afterEach, describe, it, expect, beforeEach } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 // See ErrorBoundary.test.tsx: needed so `tsc -b` sees jest-dom's augmentation.
 import "@testing-library/jest-dom/vitest";
 import "@/i18n";
 
+import { useHexStore } from "@/stores/hex-store";
 import { usePipelineStore, type HitRecord } from "@/stores/pipeline-store";
 
 import { HitsList, PipelineRunDashboard, RunDiagnostics } from "@/components/pipeline/run/PipelineRunDashboard";
@@ -238,5 +239,105 @@ describe("PipelineRunDashboard throughput row", () => {
     });
     render(<PipelineRunDashboard />);
     expect(screen.queryByTestId("pipeline-throughput")).toBeNull();
+  });
+});
+
+describe("Android Scudo run", () => {
+  const PRISTINE = usePipelineStore.getState();
+  const HEX_PRISTINE = useHexStore.getState();
+  const REFERENCE = "/dumps/run-1.msl";
+  const HIT: HitRecord = { ...PCAP_HIT, offset: 4096, size: 40, neighborhood_variance: [] };
+
+  function seedScudoRun(diagnostics: { code: string; message: string; severity: string }[]): void {
+    usePipelineStore.setState({
+      form: { ...PRISTINE.form, sourcePaths: [REFERENCE, "/dumps/run-2.msl"], scudo: { allocator: "auto" } },
+      hits: [HIT],
+      scudoSummary: {
+        source: "search-reduce:scudo",
+        num_regions: 1,
+        num_dumps: 2,
+        reference_dump: REFERENCE,
+        funnel: { signature_unique: { chunks: 1, bytes: 40 } },
+        totals: { regions: 1, bytes: 40, key_sizes: [40], stride: 1, windows: 1 },
+        not_judged: { chunks: 0, bytes: 0 },
+        diagnostics,
+      },
+    });
+  }
+
+  beforeEach(() => {
+    usePipelineStore.setState(PRISTINE, true);
+  });
+
+  afterEach(() => {
+    usePipelineStore.setState(PRISTINE, true);
+    useHexStore.setState(HEX_PRISTINE, true);
+  });
+
+  it("shows the verdict table instead of the positional funnel", () => {
+    seedScudoRun([]);
+    render(<PipelineRunDashboard />);
+    expect(screen.getByTestId("pipeline-scudo-funnel")).toBeInTheDocument();
+    expect(screen.queryByText("Reduction funnel")).toBeNull();
+  });
+
+  it("keeps the positional funnel on a positional run", () => {
+    render(<PipelineRunDashboard />);
+    expect(screen.queryByTestId("pipeline-scudo-funnel")).toBeNull();
+    expect(screen.getByText("Reduction funnel")).toBeInTheDocument();
+  });
+
+  it("separates warnings from notes and prints the backend sentence", () => {
+    seedScudoRun([
+      { code: "scudo.scope_fallback", message: "no VAS map named the heap", severity: "warning" },
+      { code: "scudo.not_judged", message: "3 chunks were never compared", severity: "info" },
+    ]);
+    render(<RunDiagnostics />);
+
+    const [warning, note] = screen.getAllByTestId("pipeline-scudo-diagnostic");
+    expect(warning).toHaveAttribute("data-severity", "warning");
+    expect(warning).toHaveTextContent("Scudo scan warning");
+    expect(warning).toHaveTextContent("no VAS map named the heap");
+    expect(note).toHaveAttribute("data-severity", "info");
+    expect(note).toHaveTextContent("Scudo scan note");
+    expect(note).toHaveTextContent("3 chunks were never compared");
+  });
+
+  it("opens a hit in the reference dump's flat view", async () => {
+    seedScudoRun([]);
+    render(<HitsList />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open in hex" }));
+
+    await waitFor(() => expect(useHexStore.getState().dumpPath).toBe(REFERENCE));
+    expect(useHexStore.getState().format).toBe("msl");
+    expect(useHexStore.getState().requestedView).toBe("vas");
+  });
+
+  it("replaces another open dump, where the offset would mean nothing", async () => {
+    useHexStore.getState().setDumpPath("/dumps/other.msl", 0, "msl");
+    seedScudoRun([]);
+    render(<HitsList />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open in hex" }));
+
+    await waitFor(() => expect(useHexStore.getState().dumpPath).toBe(REFERENCE));
+  });
+
+  it("leaves a positional run's open dump alone", async () => {
+    useHexStore.getState().setDumpPath("/dumps/other.msl", 0, "msl");
+    usePipelineStore.setState({
+      form: { ...PRISTINE.form, sourcePaths: [REFERENCE] },
+      hits: [HIT],
+    });
+    render(<HitsList />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Open in hex" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Open in hex" })).toBeEnabled(),
+    );
+    expect(useHexStore.getState().dumpPath).toBe("/dumps/other.msl");
+    expect(useHexStore.getState().requestedView).toBeNull();
   });
 });

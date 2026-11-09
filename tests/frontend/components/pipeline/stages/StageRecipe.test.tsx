@@ -123,3 +123,63 @@ describe("StageRecipe gocryptfs preset", () => {
     expect(card).toHaveTextContent(/stops at the first verified key/);
   });
 });
+
+describe("StageRecipe Android Scudo preset", () => {
+  const PRISTINE = usePipelineStore.getState();
+
+  beforeEach(() => {
+    usePipelineStore.setState({ ...PRISTINE, stage: "recipe" });
+  });
+
+  afterEach(() => {
+    usePipelineStore.setState(PRISTINE, true);
+  });
+
+  it("selects the method and clears what the method refuses", async () => {
+    const onAdvance = vi.fn();
+    usePipelineStore.getState().updateForm({ emit: { name: "p" }, nsweep: { n_values: [2] } });
+    await renderStage(onAdvance);
+
+    fireEvent.click(screen.getByTestId("pipeline-recipe-scudo"));
+
+    const { form } = usePipelineStore.getState();
+    expect(form.scudo).toEqual({ allocator: "auto" });
+    expect(form.emit).toBeNull();
+    expect(form.nsweep).toBeNull();
+    expect(onAdvance).toHaveBeenCalledWith("dumps");
+  });
+
+  it("restores full coverage after the gocryptfs recipe set stride 8", async () => {
+    await renderStage();
+    clickGocryptfs();
+    fireEvent.click(screen.getByTestId("pipeline-recipe-scudo"));
+
+    const { bruteForce } = usePipelineStore.getState().form;
+    expect(bruteForce.stride).toBe(1);
+    expect(bruteForce.exhaustive).toBe(true);
+  });
+
+  it("is left again by the gocryptfs recipe", async () => {
+    await renderStage();
+    fireEvent.click(screen.getByTestId("pipeline-recipe-scudo"));
+    clickGocryptfs();
+    expect(usePipelineStore.getState().form.scudo).toBeNull();
+  });
+
+  it("is left again by the blank recipe", async () => {
+    usePipelineStore.getState().updateForm({ scudo: { allocator: "auto" } });
+    await renderStage();
+    fireEvent.click(screen.getByRole("button", { name: /Start blank/ }));
+    expect(usePipelineStore.getState().form.scudo).toBeNull();
+  });
+
+  it("takes a Scudo key size with it when left through the blank recipe", async () => {
+    usePipelineStore.getState().updateForm({
+      scudo: { allocator: "auto" },
+      bruteForce: { ...PRISTINE.form.bruteForce, key_sizes: [48] },
+    });
+    await renderStage();
+    fireEvent.click(screen.getByRole("button", { name: /Start blank/ }));
+    expect(usePipelineStore.getState().form.bruteForce.key_sizes).toEqual([32]);
+  });
+});

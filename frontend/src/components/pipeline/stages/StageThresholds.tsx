@@ -25,12 +25,15 @@ import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import type { EmitParams, NSweepParams, PipelineRunRequest } from "@/api/pipeline";
+import { readableFailure } from "@/api/client";
 import { runPipeline } from "@/api/pipeline";
 import { withMemoryBudgetOverride, withForceMemory } from "@/api/memory-budget";
 import type { WizardStage } from "@/stores/pipeline-store";
 import { usePipelineStore } from "@/stores/pipeline-store";
 import { HeapPolicySelect } from "@/components/charts/HeapPolicySelect";
 import { defaultNValues, parseNValues } from "@/utils/n-values";
+
+import { ScudoMethodPanel } from "./ScudoMethodPanel";
 
 /** Caption + hover-help bubble shared by every field control below. */
 function FieldLabel({ label, help }: { label: string; help: string }) {
@@ -155,6 +158,7 @@ export function StageThresholds({ onAdvance }: Props) {
   // survives only to word the hint, not to gate the stage.
   const pcapOracle = Boolean(form.pcapPath?.trim());
   const nsweepOn = form.nsweep !== null;
+  const scudoOn = form.scudo !== null;
 
   // The N list is edited as free text so intermediate states ("2," while
   // typing) do not have to round-trip through the store as numbers.
@@ -211,13 +215,19 @@ export function StageThresholds({ onAdvance }: Props) {
       setSubmitError(t("stages.thresholds.noDumpsError"));
       return;
     }
+    if (form.scudo && form.sourcePaths.length < 2) {
+      setSubmitError(t("stages.thresholds.scudoNeedsTwoDumps"));
+      return;
+    }
     setSubmitError(null);
     setSubmitting(true);
     try {
       const clientRandom = form.tlsClientRandom?.trim() ?? "";
       const body: PipelineRunRequest = {
         source_paths: form.sourcePaths,
-        reduce: form.reduce,
+        // Exactly one reduction method: the server refuses thresholds that the
+        // Scudo method could only ignore.
+        ...(form.scudo ? { scudo: form.scudo } : { reduce: form.reduce }),
         brute_force: form.bruteForce,
         // Opt-in tail stages: the key is absent (not null) while the box is
         // off, so an unchanged form posts exactly the body it always did.
@@ -240,7 +250,7 @@ export function StageThresholds({ onAdvance }: Props) {
       usePipelineStore.getState().setLastRunRequest(body);
       onAdvance("running");
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : String(err));
+      setSubmitError(readableFailure(err));
     } finally {
       setSubmitting(false);
     }
@@ -252,87 +262,93 @@ export function StageThresholds({ onAdvance }: Props) {
         <h3 className="text-sm font-semibold md-text-accent">
           {t("stages.thresholds.title")}
         </h3>
-        <p className="text-xs md-text-muted">
-          {t("stages.thresholds.subtitlePrefix")}{" "}
-          <span className="md-text-accent">?</span>{" "}
-          {t("stages.thresholds.subtitleTail")}
-        </p>
+        {!scudoOn && (
+          <p className="text-xs md-text-muted">
+            {t("stages.thresholds.subtitlePrefix")}{" "}
+            <span className="md-text-accent">?</span>{" "}
+            {t("stages.thresholds.subtitleTail")}
+          </p>
+        )}
       </div>
 
-      <div className="md-panel p-3 space-y-3">
-        <div className="md-text-accent font-semibold text-xs uppercase tracking-wide">
-          {t("stages.thresholds.searchReduce")}
-        </div>
-        <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-          <NumericField
-            label={t("stages.thresholds.fields.minVariance")}
-            help={t("stages.thresholds.fields.minVarianceHelp")}
-            value={form.reduce.min_variance ?? 3000}
-            step={100}
-            onChange={(v) => patchReduce({ min_variance: v })}
-          />
-          <NumericField
-            label={t("stages.thresholds.fields.alignment")}
-            help={t("stages.thresholds.fields.alignmentHelp")}
-            value={form.reduce.alignment ?? 8}
-            step={1}
-            min={1}
-            onChange={(v) => patchReduce({ alignment: v })}
-          />
-          <NumericField
-            label={t("stages.thresholds.fields.blockSize")}
-            help={t("stages.thresholds.fields.blockSizeHelp")}
-            value={form.reduce.block_size ?? 32}
-            step={8}
-            min={8}
-            onChange={(v) => patchReduce({ block_size: v })}
-          />
-          <NumericField
-            label={t("stages.thresholds.fields.density")}
-            help={t("stages.thresholds.fields.densityHelp")}
-            value={form.reduce.density_threshold ?? 0.5}
-            step={0.05}
-            min={0}
-            onChange={(v) => patchReduce({ density_threshold: v })}
-          />
-          <NumericField
-            label={t("stages.thresholds.fields.entropyWin")}
-            help={t("stages.thresholds.fields.entropyWinHelp")}
-            value={form.reduce.entropy_window ?? 32}
-            step={8}
-            min={8}
-            onChange={(v) => patchReduce({ entropy_window: v })}
-          />
-          <NumericField
-            label={t("stages.thresholds.fields.entropyMin")}
-            help={t("stages.thresholds.fields.entropyMinHelp")}
-            value={form.reduce.entropy_threshold ?? 4.5}
-            step={0.1}
-            min={0}
-            onChange={(v) => patchReduce({ entropy_threshold: v })}
-          />
-          <NumericField
-            label={t("stages.thresholds.fields.minRegion")}
-            help={t("stages.thresholds.fields.minRegionHelp")}
-            value={form.reduce.min_region ?? 16}
-            step={1}
-            min={1}
-            onChange={(v) => patchReduce({ min_region: v })}
-          />
-          {/*
-            Only written into `reduce` once chosen, so an untouched form posts
-            the body it always did and the backend applies `"annotate"`.
-          */}
-          <div className="text-xs">
-            <HeapPolicySelect
-              testId="pipeline-heap-policy-select"
-              value={form.reduce.heap_policy}
-              onChange={(heap_policy) => patchReduce({ heap_policy })}
-              selectClassName={FIELD_INPUT_CLASS}
+      <ScudoMethodPanel />
+
+      {!scudoOn && (
+        <div className="md-panel p-3 space-y-3">
+          <div className="md-text-accent font-semibold text-xs uppercase tracking-wide">
+            {t("stages.thresholds.searchReduce")}
+          </div>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+            <NumericField
+              label={t("stages.thresholds.fields.minVariance")}
+              help={t("stages.thresholds.fields.minVarianceHelp")}
+              value={form.reduce.min_variance ?? 3000}
+              step={100}
+              onChange={(v) => patchReduce({ min_variance: v })}
             />
+            <NumericField
+              label={t("stages.thresholds.fields.alignment")}
+              help={t("stages.thresholds.fields.alignmentHelp")}
+              value={form.reduce.alignment ?? 8}
+              step={1}
+              min={1}
+              onChange={(v) => patchReduce({ alignment: v })}
+            />
+            <NumericField
+              label={t("stages.thresholds.fields.blockSize")}
+              help={t("stages.thresholds.fields.blockSizeHelp")}
+              value={form.reduce.block_size ?? 32}
+              step={8}
+              min={8}
+              onChange={(v) => patchReduce({ block_size: v })}
+            />
+            <NumericField
+              label={t("stages.thresholds.fields.density")}
+              help={t("stages.thresholds.fields.densityHelp")}
+              value={form.reduce.density_threshold ?? 0.5}
+              step={0.05}
+              min={0}
+              onChange={(v) => patchReduce({ density_threshold: v })}
+            />
+            <NumericField
+              label={t("stages.thresholds.fields.entropyWin")}
+              help={t("stages.thresholds.fields.entropyWinHelp")}
+              value={form.reduce.entropy_window ?? 32}
+              step={8}
+              min={8}
+              onChange={(v) => patchReduce({ entropy_window: v })}
+            />
+            <NumericField
+              label={t("stages.thresholds.fields.entropyMin")}
+              help={t("stages.thresholds.fields.entropyMinHelp")}
+              value={form.reduce.entropy_threshold ?? 4.5}
+              step={0.1}
+              min={0}
+              onChange={(v) => patchReduce({ entropy_threshold: v })}
+            />
+            <NumericField
+              label={t("stages.thresholds.fields.minRegion")}
+              help={t("stages.thresholds.fields.minRegionHelp")}
+              value={form.reduce.min_region ?? 16}
+              step={1}
+              min={1}
+              onChange={(v) => patchReduce({ min_region: v })}
+            />
+            {/*
+              Only written into `reduce` once chosen, so an untouched form posts
+              the body it always did and the backend applies `"annotate"`.
+            */}
+            <div className="text-xs">
+              <HeapPolicySelect
+                testId="pipeline-heap-policy-select"
+                value={form.reduce.heap_policy}
+                onChange={(heap_policy) => patchReduce({ heap_policy })}
+                selectClassName={FIELD_INPUT_CLASS}
+              />
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       <div className="md-panel p-3 space-y-3">
         <div className="md-text-accent font-semibold text-xs uppercase tracking-wide">
@@ -386,14 +402,18 @@ export function StageThresholds({ onAdvance }: Props) {
             type="checkbox"
             data-testid="emit-enable"
             checked={emitOn}
+            disabled={scudoOn}
             onChange={(e) => toggleEmit(e.target.checked)}
           />
           <span className="md-text-secondary">
             {t("stages.thresholds.emitEnableLabel")}
           </span>
         </label>
-        <p className="text-[10px] md-text-muted">
-          {t("stages.thresholds.emitHint")}
+        <p
+          className={scudoOn ? "text-xs md-text-warning" : "text-[10px] md-text-muted"}
+          data-testid="emit-hint"
+        >
+          {scudoOn ? t("scudo.pluginUnsupported") : t("stages.thresholds.emitHint")}
         </p>
         {emitOn && (
           <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
@@ -426,6 +446,7 @@ export function StageThresholds({ onAdvance }: Props) {
             type="checkbox"
             data-testid="nsweep-enable"
             checked={nsweepOn}
+            disabled={scudoOn}
             onChange={(e) => toggleNSweep(e.target.checked)}
           />
           <span className="md-text-secondary">
@@ -433,9 +454,11 @@ export function StageThresholds({ onAdvance }: Props) {
           </span>
         </label>
         <p className="text-[10px] md-text-muted">
-          {pcapOracle
-            ? t("stages.thresholds.nsweepPcapHint")
-            : t("stages.thresholds.nsweepHint")}
+          {scudoOn
+            ? t("stages.thresholds.scudoNsweepUnsupported")
+            : pcapOracle
+              ? t("stages.thresholds.nsweepPcapHint")
+              : t("stages.thresholds.nsweepHint")}
         </p>
         {nsweepOn && (
           <>
@@ -504,11 +527,15 @@ export function StageThresholds({ onAdvance }: Props) {
           disabled={submitting}
           onClick={() => void submit()}
           className="text-xs px-4 py-1.5 rounded bg-[var(--md-accent-blue)] md-text-on-accent disabled:opacity-50"
-          title={t("stages.thresholds.runTitle", {
-            optional:
-              (nsweepOn ? t("stages.thresholds.chainSweep") : "") +
-              (emitOn ? t("stages.thresholds.chainEmit") : ""),
-          })}
+          title={
+            scudoOn
+              ? t("stages.thresholds.scudoRunTitle")
+              : t("stages.thresholds.runTitle", {
+                  optional:
+                    (nsweepOn ? t("stages.thresholds.chainSweep") : "") +
+                    (emitOn ? t("stages.thresholds.chainEmit") : ""),
+                })
+          }
         >
           {submitting ? t("stages.thresholds.submitting") : t("stages.thresholds.run")}
         </button>

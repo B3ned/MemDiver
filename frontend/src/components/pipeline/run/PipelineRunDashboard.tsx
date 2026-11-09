@@ -23,13 +23,21 @@ import { StageTimingTable } from "./StageTimingTable";
 async function openHitInHex(
   hit: HitRecord,
   fallbackDump: string | null,
+  scudoRun: boolean,
 ) {
   const hex = useHexStore.getState();
   useAppStore.getState().setHexFocus({ offset: hit.offset, length: hit.size || 32 });
 
   // Navigate immediately so the jump feels responsive; the overlay (which
   // needs a network round-trip for the inferred fields) lands afterwards.
-  if (!hex.dumpPath && fallbackDump) {
+  if (scudoRun && fallbackDump) {
+    // A Scudo hit is an offset into the flat VAS view of dump 1 and means
+    // nothing in any other dump or view, so both are selected here. "msl" and
+    // not "raw": the viewer only probes a dump's views when told it is one.
+    if (hex.dumpPath !== fallbackDump) hex.setDumpPath(fallbackDump, 0, "msl");
+    useHexStore.getState().showView("vas");
+    queueMicrotask(() => useHexStore.getState().scrollToOffset(hit.offset));
+  } else if (!hex.dumpPath && fallbackDump) {
     // setDumpPath seeds HexViewer with fileSize=0 and triggers a
     // metadata refetch; defer the scroll so it lands after HexViewer
     // remounts with the real size instead of flashing an empty view.
@@ -62,6 +70,7 @@ export function HitsList(): JSX.Element | null {
   const { t } = useTranslation("pipeline");
   const hits = usePipelineStore((s) => s.hits);
   const sources = usePipelineStore((s) => s.form.sourcePaths);
+  const scudoRun = usePipelineStore((s) => s.form.scudo !== null);
   // Index of the hit whose overlay is currently being fetched, so a
   // double-click can't race two concurrent infer-fields calls.
   const [pendingHit, setPendingHit] = useState<number | null>(null);
@@ -72,7 +81,7 @@ export function HitsList(): JSX.Element | null {
     if (pendingHit !== null) return;
     setPendingHit(index);
     try {
-      await openHitInHex(hit, fallback);
+      await openHitInHex(hit, fallback, scudoRun);
     } catch (err) {
       notifyError(
         t("run.dashboard.openFailed", {
@@ -143,8 +152,10 @@ export function RunDiagnostics(): JSX.Element | null {
   const { t } = useTranslation("pipeline");
   const coverage = usePipelineStore((s) => s.coverage);
   const warnings = usePipelineStore((s) => s.warnings);
+  const scudoSummary = usePipelineStore((s) => s.scudoSummary);
+  const scudoDiagnostics = scudoSummary?.diagnostics ?? [];
 
-  if (!coverage && warnings.length === 0) return null;
+  if (!coverage && warnings.length === 0 && scudoDiagnostics.length === 0) return null;
   const isExhaustive = coverage !== null && coverage.fraction >= 1;
 
   return (
@@ -211,6 +222,27 @@ export function RunDiagnostics(): JSX.Element | null {
           <div className="text-xs">{w.message}</div>
         </div>
       ))}
+
+      {scudoDiagnostics.map((d, i) => {
+        const isWarning = d.severity === "warning";
+        return (
+          <div
+            key={`${d.code}-${i}`}
+            role="status"
+            className={`md-panel p-3 space-y-1 ${
+              isWarning ? "border md-border-warning md-text-warning" : "md-text-secondary"
+            }`}
+            data-testid="pipeline-scudo-diagnostic"
+            data-diagnostic-code={d.code}
+            data-severity={d.severity ?? ""}
+          >
+            <div className="text-xs font-semibold">
+              {t(isWarning ? "run.diagnostics.scudoWarningTitle" : "run.diagnostics.scudoNoteTitle")}
+            </div>
+            <div className="text-xs">{d.message}</div>
+          </div>
+        );
+      })}
     </div>
   );
 }

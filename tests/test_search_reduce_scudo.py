@@ -1226,3 +1226,162 @@ def test_an_untouched_command_warns_about_nothing(scudo_runs, tmp_path, monkeypa
         state, scudo_runs[0], tmp_path / "c.json"))) == 0
 
     assert "only apply to the generic" not in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# The surface hooks the web pipeline drives
+# ---------------------------------------------------------------------------
+
+
+class _Events:
+    def __init__(self):
+        self.seen = []
+
+    def __call__(self, event, **fields):
+        self.seen.append((event, fields))
+
+    def named(self, event):
+        return [fields for name, fields in self.seen if name == event]
+
+
+def _candidates_text(result) -> str:
+    return Path(result["candidates_path"]).read_text()
+
+
+def test_the_hooks_do_not_change_the_artifact_or_the_result(scudo_runs, tmp_path):
+    plain, _ = _reduce(scudo_runs, tmp_path, name="plain")
+    hooked, _ = _reduce(scudo_runs, tmp_path, name="plain", on_progress=_Events(),
+                        is_cancelled=lambda: False)
+    first = _candidates_text(plain)
+    assert first == _candidates_text(hooked)
+    assert {k: v for k, v in plain.items() if k != "candidates_path"} == \
+        {k: v for k, v in hooked.items() if k != "candidates_path"}
+
+
+def test_the_stage_stream_is_bracketed_and_reports_each_dump(scudo_runs, tmp_path):
+    events = _Events()
+    _reduce(scudo_runs, tmp_path, on_progress=events)
+
+    assert events.seen[0][0] == "stage_start"
+    assert events.seen[-1][0] == "stage_end"
+    assert {fields["stage"] for name, fields in events.seen
+            if name != "progress"} == {"search_reduce"}
+    stages = [fields["stage"] for fields in events.named("progress")]
+    assert stages == [*["search_reduce:chunk_consensus"] * N_RUNS,
+                      "search_reduce:classify", "search_reduce:regions"]
+    percentages = [fields["pct"] for fields in events.named("progress")]
+    assert percentages == sorted(percentages)
+
+
+def test_the_stage_end_is_compact_and_holds_no_memory_content(scudo_runs, tmp_path):
+    """Signature lists stay in the artifact, and bytes never leave the dump."""
+    events = _Events()
+    result, _ = _reduce(scudo_runs, tmp_path, on_progress=events)
+    (end,) = events.named("stage_end")
+    extra = end["extra"]
+
+    assert result["not_judged"]["signatures"]
+    assert extra["not_judged"] == {"chunks": result["not_judged"]["chunks"],
+                                   "bytes": result["not_judged"]["bytes"]}
+    assert result["diagnostics"] and all("details" not in d for d in extra["diagnostics"])
+    assert [d["code"] for d in extra["diagnostics"]] == \
+        [d["code"] for d in result["diagnostics"]]
+    assert extra["source"] == "search-reduce:scudo"
+    assert extra["funnel"] == result["funnel"]
+    assert extra["num_regions"] == result["num_regions"]
+    serialized = json.dumps(extra)
+    for run in range(N_RUNS):
+        assert secret_value(run).hex() not in serialized
+
+
+@pytest.mark.parametrize("after_calls", [1, 2, N_RUNS + 2], ids=["start", "scan", "regions"])
+def test_a_cancel_stops_the_producer_without_an_artifact(scudo_runs, tmp_path, after_calls):
+    calls = []
+
+    def _is_cancelled():
+        calls.append(1)
+        return len(calls) >= after_calls
+
+    events = _Events()
+    with pytest.raises(CapabilityError) as refused:
+        _reduce(scudo_runs, tmp_path, on_progress=events, is_cancelled=_is_cancelled)
+
+    assert refused.value.code == "cancelled"
+    assert events.named("error") == [{"error": "cancelled"}]
+    assert not (tmp_path / "out" / "candidates.json").exists()
+
+
+def _huge_estimate(*_args, **_kwargs):
+    from memdiver.core.memory_budget import MemoryEstimate
+
+    return MemoryEstimate(1 << 60, "test")
+
+
+def test_no_budget_gate_without_force_memory(scudo_runs, tmp_path, monkeypatch):
+    """The CLI passes nothing, so its behaviour does not change."""
+    import memdiver.engine.scudo_chunk_consensus as scc
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("the budget was checked although force_memory is None")
+
+    monkeypatch.setattr(scc, "chunk_consensus_estimate", _forbidden)
+    result, _ = _reduce(scudo_runs, tmp_path)
+    assert result["num_regions"] == 1
+
+
+def test_an_over_budget_build_is_refused_when_the_gate_is_on(scudo_runs, tmp_path, monkeypatch):
+    import memdiver.engine.scudo_chunk_consensus as scc
+
+    monkeypatch.setattr(scc, "chunk_consensus_estimate", _huge_estimate)
+    with pytest.raises(CapabilityError) as refused:
+        _reduce(scudo_runs, tmp_path, force_memory=False)
+    assert refused.value.code == "memory_budget_exceeded"
+
+
+def test_force_memory_proceeds_over_budget(scudo_runs, tmp_path, monkeypatch):
+    import memdiver.engine.scudo_chunk_consensus as scc
+
+    monkeypatch.setattr(scc, "chunk_consensus_estimate", _huge_estimate)
+    result, _ = _reduce(scudo_runs, tmp_path, force_memory=True)
+    assert result["num_regions"] == 1
+
+
+def test_the_gate_decides_on_the_first_dump_before_reading_the_others(
+    scudo_runs, tmp_path, monkeypatch,
+):
+    import memdiver.engine.scudo_chunk_consensus as scc
+
+    scanned = []
+    real_extract = scc.extract_chunks
+
+    def _counting_extract(reader):
+        scanned.append(reader)
+        return real_extract(reader)
+
+    estimated = []
+
+    def _estimate(chunks, num_dumps):
+        estimated.append((len(chunks), num_dumps))
+        return _huge_estimate()
+
+    monkeypatch.setattr(scc, "extract_chunks", _counting_extract)
+    monkeypatch.setattr(scc, "chunk_consensus_estimate", _estimate)
+
+    with pytest.raises(CapabilityError) as refused:
+        _reduce(scudo_runs, tmp_path, force_memory=False)
+
+    assert refused.value.code == "memory_budget_exceeded"
+    assert len(scanned) == 1
+    (count, num_dumps), = estimated
+    assert count > 0 and num_dumps == N_RUNS
+
+
+def test_the_refusal_only_suggests_what_a_scudo_run_accepts(scudo_runs, tmp_path, monkeypatch):
+    import memdiver.engine.scudo_chunk_consensus as scc
+
+    monkeypatch.setattr(scc, "chunk_consensus_estimate", _huge_estimate)
+    with pytest.raises(CapabilityError) as refused:
+        _reduce(scudo_runs, tmp_path, force_memory=False)
+
+    assert "region filter" not in refused.value.message
+    assert "fewer dumps" in refused.value.message

@@ -33,6 +33,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   allocators `search-reduce` accepts (parity with the CLI choices is test-guarded). See
   `docs/contributing/adding_allocator.md`.
 - `search-reduce` reduces Android Scudo heap dumps across cold boots: `consensus-begin --allocator scudo|auto` without `--size` collects the runs and `search-reduce --state` pairs their heap chunks by allocator signature and content. The chain ends at `brute-force`: Volatility 3 plugin generation is not supported yet with this method.
+- The web pipeline offers the same method (`POST /api/pipeline/run` with `scudo: {allocator}`, an "Android Scudo" recipe and method choice in the wizard, a per-verdict results table). It runs up to brute-force: Volatility 3 plugin generation, the N-sweep, escalation and refine need the positional consensus and are refused with a stated reason.
 
 ### Changed
 - The `heap_policy='mask'` precondition error names the unavailable status and its

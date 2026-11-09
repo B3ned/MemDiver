@@ -383,11 +383,19 @@ def _breakdown_text(estimate: MemoryEstimate) -> str:
     return f" [{items}]"
 
 
+#: What a refusal recommends unless the route says otherwise.
+DEFAULT_BUDGET_SUGGESTIONS = (
+    "apply a region filter (e.g. heap,stack), use fewer dumps, raise "
+    "MEMDIVER_MEMORY_BUDGET_MB / max_rss_mb, or pass force to override."
+)
+
+
 def check_budget(
     estimate: MemoryEstimate,
     *,
     force: bool = False,
     budget: Union[MemoryBudget, int, None] = None,
+    suggestions: str = DEFAULT_BUDGET_SUGGESTIONS,
 ) -> Optional[str]:
     """Refuse an operation whose estimated peak exceeds the memory budget.
 
@@ -412,9 +420,7 @@ def check_budget(
         logger.warning(warning)
         return warning
     raise CapabilityError(
-        f"{head} Suggestions: apply a region filter (e.g. heap,stack), "
-        "use fewer dumps, raise MEMDIVER_MEMORY_BUDGET_MB / max_rss_mb, "
-        "or pass force to override.",
+        f"{head} Suggestions: {suggestions}",
         category=ErrorCategory.PRECONDITION,
         code="memory_budget_exceeded",
         details={

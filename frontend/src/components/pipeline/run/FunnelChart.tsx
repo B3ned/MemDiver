@@ -14,6 +14,8 @@ import { SEQUENTIAL_RAMP } from "@/components/charts/tokens";
 import { usePipelineStore } from "@/stores/pipeline-store";
 import type { FunnelCounts } from "@/stores/pipeline-store";
 
+import { ScudoFunnel } from "./ScudoFunnel";
+
 interface FunnelRow {
   key: keyof FunnelCounts;
   labelKey: string;
@@ -43,7 +45,12 @@ function logFraction(count: number, raw: number): number {
 export function FunnelChart(): JSX.Element {
   const { t } = useTranslation("pipeline");
   const funnel = usePipelineStore((s) => s.funnel);
+  const scudoSummary = usePipelineStore((s) => s.scudoSummary);
   const raw = funnel.raw;
+
+  if (scudoSummary) {
+    return <ScudoFunnel summary={scudoSummary} verified={funnel.verified} />;
+  }
 
   return (
     <div

@@ -283,6 +283,8 @@ The chain ends at `brute-force`. Volatility 3 plugin generation is not supported
 yet with this method: a plugin is built from the per-byte variance around a hit,
 and this method compares whole heap chunks across runs instead of byte positions.
 
+The web UI runs the same reduction; see the [web UI tour](../user_guide/web_ui_tour.md#android-scudo-heaps-across-cold-boots).
+
 ## Importing only some regions
 
 ```bash

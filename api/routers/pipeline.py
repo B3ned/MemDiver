@@ -42,6 +42,7 @@ from memdiver.api.models import MemoryOverrideFields, MixedCohortFields, RegionF
 from memdiver.api.region_filter_resolution import request_region_filter
 from memdiver.api.services.task_manager import TERMINAL_STATUSES
 from memdiver.app.pipeline.pipeline_runner import get_pipeline_stages
+from memdiver.core.service_errors import CapabilityError, ErrorCategory
 from memdiver.engine.brute_force import DEFAULT_NEIGHBORHOOD_PAD
 
 logger = logging.getLogger("memdiver.api.routers.pipeline")
@@ -86,6 +87,17 @@ class NSweepParams(BaseModel):
     key_sizes: List[int] = Field(default_factory=lambda: [32])
     stride: int = 1
     exhaustive: bool = True
+
+
+class ScudoParams(BaseModel):
+    """Selects the Android Scudo method for a pipeline run.
+
+    Its own object rather than an ``allocator`` field: on the consensus routes
+    ``HeapAllocatorFields.allocator="auto"`` only annotates heap roles, while
+    here ``"auto"`` means the first dump must be detected as a Scudo heap.
+    """
+
+    allocator: Literal["scudo", "auto"] = "auto"
 
 
 class EmitParams(BaseModel):
@@ -147,6 +159,7 @@ class PipelineRunRequest(RegionFilterFields, MemoryOverrideFields, MixedCohortFi
     emit: Optional[EmitParams] = None
     escalate: bool = False
     escalate_oracle_budget: Optional[int] = None
+    scudo: Optional[ScudoParams] = None
     # ``region_filter`` / ``session_name`` come from ``RegionFilterFields``:
     # the analysis-time region view filter for the consensus stage
     # (``"heap,stack"``; ``.msl`` sources only), normalised to the
@@ -324,7 +337,56 @@ def _build_worker_params(
     worker["force_memory"] = request.force_memory
     # Cohort-mix override for the consensus + n-sweep stages (``cohort.mixed``).
     worker["mixed_ok"] = request.mixed_ok
+    if request.scudo is not None:
+        worker["scudo"] = request.scudo.model_dump()
     return worker
+
+
+def _refuse_invalid_scudo_run(request: PipelineRunRequest) -> None:
+    """Refuse a Scudo run that could not do what the request asks for.
+
+    Everything checked here is about the positional consensus, which a Scudo
+    run does not build. Silently dropping one of these options would report a
+    run the caller did not ask for, so each is refused before a worker starts.
+    """
+    from memdiver.app.tools_pipeline_android import (
+        PLUGIN_UNSUPPORTED_CODE,
+        PLUGIN_UNSUPPORTED_MESSAGE,
+        UNSUPPORTED_OPTION_CODE,
+        _validate_scudo_dumps,
+    )
+
+    if request.emit is not None:
+        raise CapabilityError(
+            PLUGIN_UNSUPPORTED_MESSAGE,
+            category=ErrorCategory.INVALID_INPUT,
+            code=PLUGIN_UNSUPPORTED_CODE,
+        )
+    unsupported = [
+        name
+        for name, requested in (
+            ("nsweep", request.nsweep is not None),
+            ("escalate", request.escalate),
+            ("region_filter", request_region_filter(request) is not None),
+            ("reduce", bool(request.reduce.model_fields_set)),
+        )
+        if requested
+    ]
+    if unsupported:
+        raise CapabilityError(
+            "the Android Scudo method compares whole heap chunks and has no "
+            f"positional consensus, so these options do not apply: "
+            f"{', '.join(unsupported)}",
+            category=ErrorCategory.INVALID_INPUT,
+            code=UNSUPPORTED_OPTION_CODE,
+            details={"options": unsupported},
+        )
+    _validate_scudo_dumps(
+        request.source_paths,
+        request.source_paths[0],
+        request.brute_force.key_sizes,
+        request.mixed_ok,
+    )
 
 
 # ------------------------------------------------------------------
@@ -386,6 +448,9 @@ def run_pipeline_endpoint(request: PipelineRunRequest):
                 detail=f"source path not found: {p}",
             )
 
+    if request.scudo is not None:
+        _refuse_invalid_scudo_run(request)
+
     # Seed the UI progress stages from the real pipeline registry (in
     # execution order) rather than a hardcoded literal, so a stage added via
     # ``register_stage`` shows up in progress tracking automatically. The two
@@ -393,6 +458,8 @@ def run_pipeline_endpoint(request: PipelineRunRequest):
     # ``Stage.enabled`` predicates check (``state.nsweep_params`` /
     # ``state.emit_params``); every other (always-enabled) stage is kept.
     optional_stage_present = {
+        # A seeded stage that never runs would stay "pending" for the whole run.
+        "consensus": request.scudo is None,
         "nsweep": request.nsweep is not None,
         "emit_plugin": request.emit is not None,
         "escalate": request.escalate,
