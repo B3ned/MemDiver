@@ -103,6 +103,7 @@ from memdiver.app.tools_pipeline import (
     verify_key_result,
     verify_vol3_plugin,
 )
+from memdiver.app.tools_pipeline_android import search_reduce_android
 
 # --- dataset / analysis -----------------------------------------------------
 from memdiver.app.tools import (
@@ -271,6 +272,7 @@ __all__ = [
     "consensus",
     "analyze_candidates",
     "search_reduce",
+    "search_reduce_android",
     "brute_force",
     "n_sweep",
     "auto_floor",

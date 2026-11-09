@@ -44,16 +44,13 @@ or whose masked content recurs in another dump (content-shared: a repeated or
 partial content group) cannot hold one. What is left is a signature-unique
 chunk whose bytes vary at all, the dynamic residue (the one per-run-unique
 chunk content alignment could pair) and every dynamic candidate (the per-run-
-unique chunks it could not pair). That is the selection rule the lab's
-``cwa_to_candidates.py`` applied to a ``consensus-window-android
---list-signatures`` JSON, carried over one to one, with two deliberate
-differences:
+unique chunks it could not pair). Two details of that rule are deliberate:
 
 * a chunk is listed ONCE. A dynamic-residue chunk is also one of its
-  signature's ``dynamic_candidates``; reading both lists emitted it twice, so
-  ``brute-force`` tested it twice and would report a secret in it as two hits;
-* "variance > 0" is the exact float, not the two-decimal value the JSON
-  carries, so a chunk in which a single byte differs is never rounded away.
+  signature's ``dynamic_candidates``; reading both lists would emit it twice, so
+  ``brute-force`` would test it twice and report a secret in it as two hits;
+* "variance > 0" is the exact float, not the two-decimal value the provenance
+  JSON carries, so a chunk in which a single byte differs is never rounded away.
 
 LIMITATIONS (honest, and reported rather than hidden):
 
@@ -88,7 +85,7 @@ from memdiver.engine.scudo_chunk_consensus import (
 logger = logging.getLogger("memdiver.engine.scudo_candidates")
 
 __all__ = [
-    "SEARCH_REDUCE_ANDROID_VERSION",
+    "SCUDO_CANDIDATES_VERSION",
     "VERDICT_SIGNATURE_UNIQUE",
     "VERDICT_SIGNATURE_INVARIANT",
     "VERDICT_DYNAMIC_RESIDUE",
@@ -105,9 +102,10 @@ __all__ = [
     "verdict_funnel",
 ]
 
-#: Version of the ``search-reduce-android`` subcommand, stamped into every
-#: ``candidates.json`` it writes beside the chunk-consensus version it read.
-SEARCH_REDUCE_ANDROID_VERSION = "0.1.0"
+#: Format version of the Scudo ``candidates.json`` summary, stamped beside the
+#: chunk-consensus version it read. It counts changes to this method's output
+#: and is independent of the MemDiver package version.
+SCUDO_CANDIDATES_VERSION = "0.1.0"
 
 # --------------------------------------------------------------------------
 # Verdicts. Stable strings: they are written into candidates.json and keyed
@@ -197,12 +195,12 @@ def _row_verdict(content_class: str, mean_variance: float) -> str:
 def _dynamic_vas(scc: ScudoChunkConsensus, dump_index: int) -> set:
     """User VAs of ``dump_index``'s dynamic candidates, over every signature.
 
-    Read from the same ``content_alignment.per_signature[*].dynamic_candidates``
-    provenance ``--list-signatures`` writes, so the two surfaces cannot
-    disagree about which chunks are dynamic. No content block (nothing was
-    ambiguous) means no dynamic candidates.
+    Read from the ``content_alignment.per_signature[*].dynamic_candidates``
+    provenance, so the verdicts and the reported consensus cannot disagree
+    about which chunks are dynamic. No content block (nothing was ambiguous)
+    means no dynamic candidates.
     """
-    out = set()
+    out: set[int] = set()
     if scc.content is None:
         return out
     for entry in scc.content.per_signature.values():

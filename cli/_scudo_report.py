@@ -1,7 +1,7 @@
 """The stderr funnel for ``search-reduce``'s Scudo mode.
 
 A thin presenter over the summary
-:func:`memdiver.app.tools_pipeline_android._search_reduce_android` returns: the
+:func:`memdiver.app.tools_pipeline_android.search_reduce_android` returns: the
 reference's scan scope, every verdict (kept / dropped / not judged), the window
 total and the diagnostics. The artifact itself goes to ``--output``; this is the
 short human-readable account that goes to stderr, mirroring what the generic

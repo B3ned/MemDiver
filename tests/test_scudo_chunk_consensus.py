@@ -1,7 +1,7 @@
 """engine.scudo_chunk_consensus: Scudo geometry, chunk extraction, pairing.
 
-``consensus-window-android`` is only as good as the correspondence this engine
-hands the shared window producer, so the engine's three claims are pinned here
+The Scudo reduction is only as good as the correspondence this engine hands its
+consumers, so the engine's three claims are pinned here
 on their own, below any surface:
 
 **C1 -- a chunk is what the allocator says it is.** A header is judged by the
@@ -103,7 +103,7 @@ def _write(tmp_path, name, page, *, vas_entries=None, **region_kwargs):
 
 
 def _extract(path):
-    """``(regions, chunks)`` for one dump; 0.2.0's scope is dropped here.
+    """``(regions, chunks)`` for one dump; the scan scope is dropped here.
 
     Scope is pinned separately in :func:`_scope` and the VAS-scope tests; the
     many extraction tests below read only regions and chunks.
@@ -545,15 +545,15 @@ def test_coverage_warning_never_calls_an_ambiguous_chunk_absent(tmp_path, with_a
 
 
 # ---------------------------------------------------------------------------
-# VAS region scope (0.2.0): scan only [anon:scudo:primary], fall back honestly
+# VAS region scope: scan only [anon:scudo:primary], fall back honestly
 # ---------------------------------------------------------------------------
 #
 # memslicer writes a VAS map (block 0x1001) on every capture, naming every
 # enumerated range -- captured or not -- with the kernel's /proc/<pid>/maps
-# label. 0.2.0 uses it to scan only the Scudo primary heap, so a header-shaped
-# word in an ART region is no longer mistaken for a chunk. When the map is
-# absent or names no primary region the scan falls back to every RW region
-# (0.1.0), never to "0 chunks because the names were missing".
+# label. The scan uses it to cover only the Scudo primary heap, so a
+# header-shaped word in an ART region is not mistaken for a chunk. When the map
+# is absent or names no primary region the scan falls back to every RW region,
+# never to "0 chunks because the names were missing".
 
 #: A second RW region, far from BASE, standing in for the ART managed heap.
 DECOY_BASE = BASE + 0x200000
@@ -602,7 +602,7 @@ def test_vas_scope_scans_only_the_named_primary_region(tmp_path):
 
 
 def test_without_a_vas_map_the_scan_falls_back_to_every_rw_region(tmp_path, caplog):
-    """No map -> 0.1.0 behaviour: the decoy IS extracted, and a warning says so.
+    """No map -> every RW region: the decoy IS extracted, and a warning says so.
 
     Non-vacuous against the test above: the only change is the missing VAS map,
     and it flips the decoy from absent to present.
@@ -792,12 +792,13 @@ def test_scope_matches_exactly_the_primary_named_regions(tmp_path, seed):
 
 
 # ---------------------------------------------------------------------------
-# Content alignment (0.2.0): pointer masking + invariant-content pairing
+# Content alignment: pointer masking + invariant-content pairing
 # ---------------------------------------------------------------------------
 #
-# A signature present more than once in a dump is 0.1.0-ambiguous. 0.2.0 groups
-# its chunks by their POINTER-MASKED content and pairs the groups that line up
-# one per dump: a static allocation whose only per-run difference is an ASLR
+# A signature present more than once in a dump is ambiguous by header alone.
+# Content alignment groups its chunks by their POINTER-MASKED content and pairs
+# the groups that line up one per dump: a static allocation whose only per-run
+# difference is an ASLR
 # pointer (``content_invariant``), or -- when every dump leaves exactly one --
 # the lone chunk whose content is unique to a dump (``dynamic_residue``, the
 # moved secret). Raw bytes are never altered; masking only decides pairing.
@@ -1013,8 +1014,8 @@ def test_partial_content_present_in_some_but_not_all_dumps_is_counted(tmp_path):
     assert SECRET_SIG in scc.ambiguous
 
 
-def test_content_alignment_off_is_the_old_behaviour_exactly(tmp_path):
-    """``content_alignment=False`` is the 0.1.0 pairing: the signature is skipped.
+def test_content_alignment_off_pairs_by_signature_alone(tmp_path):
+    """``content_alignment=False`` pairs by signature alone: the signature is skipped.
 
     No content rows, the signature stays ambiguous, and the provenance marks
     content alignment disabled. This is the regression guard for the flag.
@@ -1091,6 +1092,6 @@ def test_dynamic_candidate_vas_and_sizes_are_listed_per_dump(tmp_path):
         expected = {hex(content_dynamic_user_va(run, statics=1, k=k)) for k in (0, 1)}
         assert {r["va"] for r in per_dump} == expected
         assert {r["size"] for r in per_dump} == {SECRET_SIZE}
-    # The field round-trips through JSON (it reaches --list-signatures output).
+    # The field round-trips through JSON (it reaches the provenance block).
     import json as _json
     assert _json.loads(_json.dumps(cands)) == cands

@@ -13,8 +13,8 @@ its layout on three levels that a positional overlay cannot see through:
 
 So two dumps of the same program put the same allocation at a different region,
 a different slot, and a different virtual address every run. ``consensus-window``
-(VA / module-offset alignment) therefore cannot recover a value that moved, and
-the spin-up experiment confirms it: a randomly generated heap secret is lost.
+(VA / module-offset alignment) therefore cannot recover a value that moved: a
+randomly generated heap secret is lost.
 
 What this engine does instead
 -----------------------------
@@ -35,8 +35,19 @@ alignment differs only in HOW correspondence is established; once it exists it
 is the same slab, so the whole windowing machinery
 (:func:`memdiver.app.tools_consensus.aligned_window_from_vector`) serves a
 chunk-aligned window with no second, differently-wrong copy of the slab -> VA
-arithmetic. ``consensus-window-android`` is therefore a true sibling of
-``consensus-window``: same output contract, different alignment.
+arithmetic. ``search-reduce`` consumes it through
+:mod:`memdiver.engine.scudo_candidates`.
+
+Why this does not build on :mod:`memdiver.heap.allocators.scudo`
+-----------------------------------------------------------------
+Both read the same ``UnpackedHeader``, for different jobs. ``parse_scudo`` maps
+a heap without knowing the Android release: it infers each class's stride from
+where headers repeat, so a class needs at least two headers, and a
+low-confidence slot falls back to ``user_len = stride - header``. A signature
+here needs the exact requested size of every allocated chunk, even in a class
+with a single live chunk, across whole regions. So the headers are tested in one
+vectorised pass against Scudo's own size-class table, without the parser's
+``max_chunks`` budget (200,000 by default).
 
 Scudo facts are taken from AOSP ``platform/external/scudo`` @
 ``android-17.0.0_r1``:
@@ -57,11 +68,14 @@ LIMITATIONS (honest, and the point of the measurement):
   the dump does not hold it, so it is not compared;
 * the header scan is restricted to the regions the dump's VAS map names
   ``[anon:scudo:primary]`` (:class:`ScudoScanScope`); a dump with no VAS map, or
-  one that names no primary region, falls back to every RW region (0.1.0) and
+  one that names no primary region, falls back to every RW region and
   can then mistake a header-shaped word in ``dalvik-*`` / ``boot*.art`` / a
   thread stack for a chunk; secondary (large) allocations are never covered;
 * the header checksum is a per-process nonce a dump reader never has, so headers
-  are judged on structure, not on their checksum.
+  are judged on structure, not on their checksum;
+* the size-class table is pinned to ``android-17.0.0_r1`` (64-bit). On a release
+  with a different ``AndroidNormalSizeClassConfig``, valid chunks fail the
+  size-fits-class test and are not extracted.
 """
 
 from __future__ import annotations
@@ -97,7 +111,7 @@ __all__ = [
     "PRIMARY_MAPPING_NAME",
     "SCOPE_VAS_PRIMARY",
     "SCOPE_ALL_RW",
-    "SUBCOMMAND_VERSION",
+    "CHUNK_CONSENSUS_VERSION",
     "CONTENT_SIGNATURE_UNIQUE",
     "CONTENT_INVARIANT",
     "CONTENT_DYNAMIC_RESIDUE",
@@ -153,28 +167,25 @@ PROT_RW = 3
 #: EXACT, never a prefix: ``[anon:scudo:primary]`` is itself a prefix of
 #: ``[anon:scudo:primary_reserve]`` (the PROT_NONE reserve) and of nothing the
 #: primary heap allocates from. A kernel that gave the label without brackets
-#: has not been observed on the lab's images; such a dump takes the fallback.
+#: has not been observed so far; such a dump takes the fallback.
 PRIMARY_MAPPING_NAME = "[anon:scudo:primary]"
 
 #: ``region_scope.kind`` recorded per dump: the VAS-named primary scan, or the
-#: 0.1.0 fallback over every RW region when the map cannot name the heap.
+#: fallback over every RW region when the map cannot name the heap.
 SCOPE_VAS_PRIMARY = "vas:scudo_primary"
 SCOPE_ALL_RW = "all_rw_fallback"
 
-#: Version of the consensus-window-android subcommand that produced a payload,
-#: stamped into the ``scudo_alignment`` block. 0.1.0 scanned every RW region and
-#: paired on the header signature alone; 0.2.0 restricts the scan to VAS
-#: ``[anon:scudo:primary]`` regions and adds pointer-masked content
-#: classification for otherwise-ambiguous signatures. A payload without the
-#: field was produced by 0.1.0.
-SUBCOMMAND_VERSION = "0.2.0"
+#: Format version of the chunk-consensus provenance, stamped into the
+#: ``scudo_alignment`` block and into ``candidates.json``. It counts changes to
+#: this method's output and is independent of the MemDiver package version.
+CHUNK_CONSENSUS_VERSION = "0.2.0"
 
 # --------------------------------------------------------------------------
-# Content alignment (0.2.0): pointer masking + invariant-content pairing
+# Content alignment: pointer masking + invariant-content pairing
 # --------------------------------------------------------------------------
 
-#: ``content_class`` of an aligned row. A signature-unique row is paired the
-#: 0.1.0 way (one chunk per dump, by header signature alone). A content-invariant
+#: ``content_class`` of an aligned row. A signature-unique row is paired by
+#: header signature alone (one chunk per dump). A content-invariant
 #: row is a group within an otherwise-ambiguous signature whose POINTER-MASKED
 #: bytes occur exactly once in every dump. A dynamic-residue row is the one
 #: chunk per dump whose masked content occurs in no other dump, paired only when
@@ -288,8 +299,8 @@ class ScudoRegion:
 class ScudoScanScope:
     """Which RW regions one dump's header scan looked at, and why.
 
-    0.2.0 narrows the scan from "every RW region" (0.1.0) to the regions a
-    memslicer VAS map names :data:`PRIMARY_MAPPING_NAME`. The VAS map (block
+    The scan covers the regions a memslicer VAS map names
+    :data:`PRIMARY_MAPPING_NAME`. The VAS map (block
     ``0x1001``) is written on every capture, encrypted or not, and covers even
     unreadable and skipped ranges, so the scope is available from the ``.msl``
     alone -- the device's ``.maps`` file is never needed. When the dump carries
@@ -395,7 +406,7 @@ def _scope_from_vas(
     region: :class:`~memdiver.msl.region_names.MappingNameIndex` resolves a base
     that sits inside an entry, not only one equal to its start, so a region
     whose recorded base falls within a larger primary mapping still matches.
-    Otherwise every RW region is in scope (the 0.1.0 behaviour) and a warning
+    Otherwise every RW region is in scope and a warning
     is logged -- never "0 chunks because the names were missing".
     """
     n_primary = sum(e.mapped_path == PRIMARY_MAPPING_NAME for e in entries)
@@ -405,9 +416,9 @@ def _scope_from_vas(
                 SCOPE_VAS_PRIMARY, reason)
     reason = ("dump carries no VAS map" if not entries
               else f"VAS map names no {PRIMARY_MAPPING_NAME} region")
-    logger.warning("scudo chunk scan: %s; scanning every RW region (0.1.0 "
-                   "behaviour) -- header-shaped words outside the Scudo primary "
-                   "heap may be mistaken for chunks", reason)
+    logger.warning("scudo chunk scan: %s; scanning every RW region -- "
+                   "header-shaped words outside the Scudo primary heap may be "
+                   "mistaken for chunks", reason)
     return (lambda _base: True, SCOPE_ALL_RW, reason)
 
 
@@ -571,7 +582,7 @@ def _mask_pointer_words(
       consequentially the fixed ART heap ``0x02000000..0x32000000``, so a plain
       number in that window is blanked as if it were a pointer;
     * on ARM64 a tagged pointer (top-byte-ignore, e.g. ``0xb4..``) would need its
-      top byte stripped before this range test; the lab corpus is x86_64, so
+      top byte stripped before this range test; the corpus tested so far is x86_64, so
       that is only noted here, not handled.
     """
     n = len(data) // 8
@@ -729,8 +740,8 @@ def _content_align(
         # output otherwise only COUNTS. ``size`` is the chunk's user length (the
         # signature's ``s``), carried per candidate for convenience.
         dynamic_candidates = [
-            sorted(({"va": hex(m.chunk.user_va), "size": len(m.chunk.data)}
-                    for m in dyn), key=lambda r: int(r["va"], 16))
+            [{"va": hex(m.chunk.user_va), "size": len(m.chunk.data)}
+             for m in sorted(dyn, key=lambda m: m.chunk.user_va)]
             for dyn in dynamic
         ]
         dynamic_paired = n >= 2 and all(cnt == 1 for cnt in dyn_per_dump)
@@ -873,16 +884,14 @@ class ScudoChunkConsensus:
     def alignment_provenance(self) -> Dict[str, Any]:
         """The ``scudo_alignment`` block attached to a window payload.
 
-        Additive across versions: 0.1.0's keys (``method``, ``aligned_signatures``,
-        ``ambiguous_skipped``, ``missing_skipped``, ``empty_skipped``) keep their
-        meaning and form. 0.2.0 adds ``version``, ``region_scope`` (one entry per
-        dump, in ``dump_paths`` order) and ``content_alignment``; ``aligned_signatures``
-        now also carries content-paired rows, each tagged ``content_class``, and
-        ``ambiguous_skipped`` keeps the meaning "at least partially unpaired".
+        ``region_scope`` has one entry per dump, in ``dump_paths`` order.
+        ``aligned_signatures`` also carries content-paired rows, each tagged
+        ``content_class``, and ``ambiguous_skipped`` means "at least partially
+        unpaired".
         """
         block = {
             "method": ALIGNMENT_SCUDO_CHUNK,
-            "version": SUBCOMMAND_VERSION,
+            "version": CHUNK_CONSENSUS_VERSION,
             "aligned_signatures": [r.to_dict() for r in self.signatures],
             "ambiguous_skipped": list(self.ambiguous),
             "missing_skipped": list(self.missing),
@@ -942,7 +951,7 @@ def _coverage_warnings(
     The ambiguous byte figure is ``discarded - missing`` rather than the sum of
     all ambiguous chunks: with content alignment on, some chunks of an ambiguous
     signature are now PAIRED, so only the rest is still discarded. With content
-    off the two are equal, so the message is byte-identical to 0.1.0's.
+    off the two are equal.
     """
     if not coverage.n_sources or not sum(coverage.bytes_available):
         return ()
@@ -1015,7 +1024,7 @@ def _assemble_vector(
     ``row_class`` / ``row_masked_offsets`` annotate the content-paired rows by
     their slice key; a slice absent from them is a signature-unique row
     (:data:`CONTENT_SIGNATURE_UNIQUE`, no masked words). Signature-unique slices
-    come first and in their 0.1.0 order, so their slab offsets -- and therefore
+    come first and in sorted order, so their slab offsets -- and therefore
     their windows -- are byte-identical whether or not content alignment ran.
     """
     row_class = row_class or {}
@@ -1081,10 +1090,10 @@ def build_chunk_consensus(
     :param key_material: Optional ``open_dump`` keyword arguments for encrypted
         containers.
     :param thresholds: Optional variance band boundaries for classification.
-    :param content_alignment: When True (0.2.0 default), subdivide each AMBIGUOUS
+    :param content_alignment: When True (the default), subdivide each AMBIGUOUS
         signature by pointer-masked content, pairing the groups that line up one
         per dump (:func:`_content_align`). Signature-unique pairings are
-        untouched either way; ``False`` is exactly the 0.1.0 pairing.
+        untouched either way; ``False`` pairs by header signature alone.
     """
     from memdiver.engine.consensus_service import open_consensus_sources
 

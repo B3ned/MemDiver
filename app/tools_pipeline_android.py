@@ -12,8 +12,9 @@ content alignment on), gives every chunk of ONE reference dump a verdict
 chunks as ``candidates.json`` in the reference's flat ``"vas"`` view: the
 coordinates ``brute-force --dump <reference>`` slices its windows from.
 
-It is an internal helper behind the ``search-reduce`` command (selected by the
-kind of ``--state`` session), not a standalone capability.
+The ``search-reduce`` command reaches it through the kind of its ``--state``
+session; it is registered as ``pipeline.search_reduce_android`` in
+:mod:`memdiver.app.capabilities`.
 
 The chain it completes::
 
@@ -392,7 +393,7 @@ def _diagnostics(
 # --------------------------------------------------------------------------
 
 
-def _search_reduce_android(
+def search_reduce_android(
     *,
     dump_paths: Sequence[str],
     reference_path: str,
@@ -407,8 +408,7 @@ def _search_reduce_android(
 ) -> Dict[str, Any]:
     """Reduce N Android Scudo dumps to ``brute-force`` candidates of one reference.
 
-    Internal helper behind the ``search-reduce`` command's Scudo
-    mode; not a registered capability (the command's capability covers it).
+    Backs the ``search-reduce`` command's Scudo mode.
 
     Builds the chunk-signature consensus over ``dump_paths`` (content alignment
     on), classifies every Scudo primary chunk of ``reference_path`` and writes
@@ -440,15 +440,15 @@ def _search_reduce_android(
     """
     from memdiver.core.dump_source import open_dump
     from memdiver.engine.scudo_candidates import (
-        SEARCH_REDUCE_ANDROID_VERSION,
+        SCUDO_CANDIDATES_VERSION,
         VERDICT_MISSING,
         classify_chunks,
         verdict_funnel,
     )
     from memdiver.engine.scudo_chunk_consensus import (
         ALIGNMENT_SCUDO_CHUNK,
+        CHUNK_CONSENSUS_VERSION,
         SCOPE_ALL_RW,
-        SUBCOMMAND_VERSION,
         build_chunk_consensus,
     )
 
@@ -499,7 +499,7 @@ def _search_reduce_android(
         skipped=skipped, not_judged=not_judged, fallback_dumps=fallback)
     consensus = {
         "method": ALIGNMENT_SCUDO_CHUNK,
-        "version": SUBCOMMAND_VERSION,
+        "version": CHUNK_CONSENSUS_VERSION,
         "aligned_rows": len(scc.signatures),
         "ambiguous_signatures": len(scc.ambiguous),
         "missing_signatures": len(scc.missing),
@@ -507,7 +507,7 @@ def _search_reduce_android(
     }
     summary = {
         "source": _SOURCE,
-        "version": SEARCH_REDUCE_ANDROID_VERSION,
+        "version": SCUDO_CANDIDATES_VERSION,
         "consensus": consensus,
         "N": len(paths),
         "dumps": list(scc.dump_paths),

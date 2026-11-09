@@ -75,7 +75,7 @@ def _cmd_search_reduce(args: argparse.Namespace) -> int:
     * an Android Scudo collect session -> pair heap chunks by allocator
       signature + content across cold boots and keep the reference's
       per-run-value chunks
-      (:func:`app.tools_pipeline_android._search_reduce_android`), with the
+      (:func:`app.tools_pipeline_android.search_reduce_android`), with the
       allocator resolved from the session (``scudo`` forces, ``auto`` detects on
       the reference via memdiver's allocator detection).
 
@@ -192,7 +192,7 @@ def _search_reduce_scudo(args: argparse.Namespace, state: dict) -> int:
     """
     import tempfile
 
-    from memdiver.app.tools_pipeline_android import _search_reduce_android
+    from memdiver.app.tools_pipeline_android import search_reduce_android
 
     from ._scudo_report import print_scudo_funnel
 
@@ -204,7 +204,7 @@ def _search_reduce_scudo(args: argparse.Namespace, state: dict) -> int:
         key_sizes = list(raw_sizes)
     dump_paths = [str(p) for p in (state.get("dump_paths") or [])]
     with tempfile.TemporaryDirectory() as scratch:
-        result = _search_reduce_android(
+        result = search_reduce_android(
             dump_paths=dump_paths,
             reference_path=args.reference_dump,
             output_dir=scratch,

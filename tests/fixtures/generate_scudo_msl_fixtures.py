@@ -57,7 +57,7 @@ PRIMARY_NAME = "[anon:scudo:primary]"
 PRIMARY_RESERVE_NAME = "[anon:scudo:primary_reserve]"
 SECONDARY_NAME = "[anon:scudo:secondary]"
 #: A read/write ART region whose object words can look like plausible headers --
-#: the decoy the 0.1.0 all-RW scan mistook for Scudo chunks.
+#: the decoy an all-RW scan mistakes for Scudo chunks.
 DALVIK_NAME = "[anon:dalvik-main space]"
 
 
@@ -153,7 +153,7 @@ def _heap_page(run: int) -> bytes:
     """The class-3 region: the unique secret plus two ambiguous fillers.
 
     The two fillers carry the SAME constant bytes, so they stay one ambiguous
-    signature under 0.2.0's content alignment too: identical masked content with
+    signature under content alignment too: identical masked content with
     count two in every dump is ``content_invariant_repeated`` (G3 -- counted, not
     paired), not a pairable one-per-dump group. That keeps ``scudo:c3:o0:s48``
     the fixture's "ambiguous, skipped" case regardless of content alignment.
@@ -247,9 +247,9 @@ def write_scudo_msl(path, regions: Sequence[RegionSpec], *,
     AES-256-GCM container that reads back EMPTY without that key.
 
     ``vas_entries`` (``MslVasEntry`` objects, e.g. from :func:`vas_entry`) writes
-    a VAS map (block ``0x1001``) so 0.2.0's scan can scope by mapping name;
+    a VAS map (block ``0x1001``) so the scan can scope by mapping name;
     ``None`` (the default) writes NO VAS map, so the dump takes the all-RW
-    fallback -- the state every pre-0.2.0 fixture is in.
+    fallback.
     """
     from memdiver.msl.writer import MslEncryptionConfig, MslWriter
 
@@ -303,7 +303,7 @@ def write_neighbour_run(path, run: int, *, moved: bool = True,
     """Write neighbour run ``run`` (0-based) to ``path``.
 
     ``vas=True`` names the heap region :data:`PRIMARY_NAME` in a VAS map, so the
-    run takes 0.2.0's VAS scope instead of the all-RW fallback.
+    run takes the VAS scope instead of the all-RW fallback.
     """
     base = neighbour_base(run, moved=moved)
     page = neighbour_page(run, moved=moved)
@@ -337,7 +337,7 @@ def write_neighbour_runs(root, n_runs: int = 3, *, moved: bool = True,
 #
 # Every chunk here is class 3 / 40 user bytes -> the single signature
 # :data:`SECRET_SIG`, present more than once per run, so it is AMBIGUOUS and
-# 0.2.0's content alignment is what has to tell its chunks apart. The region is
+# content alignment is what has to tell its chunks apart. The region is
 # named ``[anon:scudo:primary]`` and the pointers point into it, so the VAS-map
 # pointer mask recognises them. Three kinds of chunk:
 #

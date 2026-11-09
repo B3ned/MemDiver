@@ -11,9 +11,9 @@ the mode is held to what makes the chain trustworthy:
 
 * **Partition.** Every chunk of the reference gets exactly one verdict, so the
   funnel always adds up to the chunks the reference holds.
-* **One to one.** The kept set is the lab's ``cwa_to_candidates.py`` rule --
-  rebuilt below from the ``--list-signatures`` JSON provenance, independently
-  of the classifier -- deduplicated and nothing else.
+* **One to one.** The kept set is the selection rule -- rebuilt below from the
+  JSON provenance, independently of the classifier -- deduplicated and nothing
+  else.
 * **The bytes contract.** Every region, sliced out of the reference exactly as
   brute-force reads it (``read_all()``), is the chunk the consensus judged.
 * **Refusals instead of silent wrong answers**: a dump named twice, a
@@ -48,7 +48,7 @@ from memdiver.app.tools_pipeline_android import (  # noqa: E402
     SCOPE_FALLBACK_CODE,
     TOO_FEW_DUMPS_CODE,
     WRONG_ALLOCATOR_CODE,
-    _search_reduce_android,
+    search_reduce_android,
 )
 from memdiver.core.dump_source import open_dump  # noqa: E402
 from memdiver.core.service_errors import (  # noqa: E402
@@ -59,7 +59,7 @@ from memdiver.core.service_errors import (  # noqa: E402
 from memdiver.engine.brute_force import count_candidate_slices  # noqa: E402
 from memdiver.engine.scudo_candidates import (  # noqa: E402
     KEEP_VERDICTS,
-    SEARCH_REDUCE_ANDROID_VERSION,
+    SCUDO_CANDIDATES_VERSION,
     VERDICT_CONTENT_INVARIANT,
     VERDICT_CONTENT_SHARED,
     VERDICT_DYNAMIC_CANDIDATE,
@@ -73,7 +73,7 @@ from memdiver.engine.scudo_candidates import (  # noqa: E402
 )
 from memdiver.engine.scudo_chunk_consensus import (  # noqa: E402
     ALIGNMENT_SCUDO_CHUNK,
-    SUBCOMMAND_VERSION,
+    CHUNK_CONSENSUS_VERSION,
     build_chunk_consensus,
 )
 from tests.fixtures.generate_msl_fixtures import PAGE_SIZE  # noqa: E402
@@ -177,7 +177,7 @@ def _reduce(paths, tmp_path, ref: int = 0, name: str = "out", **kw):
     """
     kw.setdefault("key_sizes", (SECRET_SIZE,))
     kw.setdefault("allocator", "scudo")
-    result = _search_reduce_android(dump_paths=paths, reference_path=paths[ref],
+    result = search_reduce_android(dump_paths=paths, reference_path=paths[ref],
                                     output_dir=str(tmp_path / name), **kw)
     return result, json.loads(Path(result["candidates_path"]).read_text())
 
@@ -213,14 +213,13 @@ def _reference_bytes(path, **km) -> bytes:
         return source.read_all()
 
 
-def _lab_rule(provenance: dict, dump_index: int) -> set:
-    """The selection of the lab's ``cwa_to_candidates.py``, over the JSON it read.
+def _selection_rule(provenance: dict, dump_index: int) -> set:
+    """The selection rule, computed independently from the JSON provenance.
 
-    ``collect()`` of that script, logic for logic: aligned rows tagged
-    ``dynamic_residue``, ``signature_unique`` rows whose (two-decimal) mean
-    variance is above zero, and every dynamic candidate of the dump -- as
-    ``(va, length)`` pairs, which deduplicates the residue the script listed
-    twice.
+    Aligned rows tagged ``dynamic_residue``, ``signature_unique`` rows whose
+    (two-decimal) mean variance is above zero, and every dynamic candidate of
+    the dump -- as ``(va, length)`` pairs, which deduplicates a residue chunk
+    that is listed in both places.
     """
     out = set()
     for row in provenance["aligned_signatures"]:
@@ -242,7 +241,7 @@ def _lab_rule(provenance: dict, dump_index: int) -> set:
 
 @pytest.mark.parametrize("ref", range(N_RUNS))
 def test_t1_the_chain_finds_each_runs_own_secret(scudo_runs, tmp_path, ref):
-    """search-reduce-android -> brute-force recovers THIS run's moved secret.
+    """search-reduce -> brute-force recovers THIS run's moved secret.
 
     The secret sits in a different slot at a different base VA every run, so
     no positional overlay pairs it; the candidates must still name exactly its
@@ -279,7 +278,7 @@ def test_t1_an_unpaired_dynamic_candidate_is_found_too(crowded_runs, tmp_path, r
 
 
 # ---------------------------------------------------------------------------
-# Engine: one verdict per chunk, and the lab rule one to one
+# Engine: one verdict per chunk, and the selection rule one to one
 # ---------------------------------------------------------------------------
 
 
@@ -297,14 +296,14 @@ def test_verdicts_partition_the_reference_chunks(family_runs, ref):
 
 
 @pytest.mark.parametrize("ref", range(N_RUNS))
-def test_the_kept_set_is_the_lab_rule_one_to_one(family_runs, ref):
-    """The classifier's kept chunks == cwa_to_candidates.py over the same build,
-    read the way the script read it: from the JSON-serialised provenance."""
+def test_the_kept_set_is_the_selection_rule_one_to_one(family_runs, ref):
+    """The classifier's kept chunks == the selection rule over the same build,
+    read from the JSON-serialised provenance."""
     _name, paths = family_runs
     scc = build_chunk_consensus(paths)
     provenance = json.loads(json.dumps(scc.alignment_provenance()))
     kept = {(v.va, v.length) for v in classify_chunks(scc, ref) if v.kept}
-    assert kept == _lab_rule(provenance, ref)
+    assert kept == _selection_rule(provenance, ref)
     assert kept, "every family carries at least one per-run chunk"
 
 
@@ -404,9 +403,9 @@ def test_every_region_is_the_chunk_in_brute_forces_view(family_runs, tmp_path, r
 def test_candidates_json_carries_the_contract(scudo_runs, tmp_path):
     result, cand = _reduce(scudo_runs, tmp_path)
     assert cand["source"] == "search-reduce:scudo"
-    assert cand["version"] == SEARCH_REDUCE_ANDROID_VERSION
+    assert cand["version"] == SCUDO_CANDIDATES_VERSION
     assert cand["consensus"]["method"] == ALIGNMENT_SCUDO_CHUNK
-    assert cand["consensus"]["version"] == SUBCOMMAND_VERSION
+    assert cand["consensus"]["version"] == CHUNK_CONSENSUS_VERSION
     assert cand["N"] == N_RUNS and cand["dumps"] == scudo_runs
     assert cand["reference_dump"] == scudo_runs[0] and cand["reference_index"] == 0
     # Offsets are in the UNFILTERED view: no filter may be handed downstream.
@@ -553,7 +552,7 @@ def test_no_chunk_at_all_is_named_as_such(tmp_path):
 def _refused(paths, reference, tmp_path, **kw) -> CapabilityError:
     kw.setdefault("allocator", "scudo")
     with pytest.raises(CapabilityError) as excinfo:
-        _search_reduce_android(dump_paths=paths, reference_path=reference,
+        search_reduce_android(dump_paths=paths, reference_path=reference,
                                output_dir=str(tmp_path / "refused"), **kw)
     assert not (tmp_path / "refused").exists()
     return excinfo.value
@@ -610,7 +609,7 @@ def test_a_locked_dump_is_refused_not_misread(tmp_path, aes_key):
                                      key=aes_key if run == 2 else None))
              for run in range(N_RUNS)]
     with pytest.raises(EncryptedDumpLockedError):
-        _search_reduce_android(dump_paths=paths, reference_path=paths[0],
+        search_reduce_android(dump_paths=paths, reference_path=paths[0],
                                output_dir=str(tmp_path / "locked"), allocator="scudo")
 
 
@@ -788,7 +787,7 @@ def test_cli_pipeline_writes_candidates_and_prints_the_funnel(
     captured = capsys.readouterr()
     assert captured.out == ""
     err = captured.err
-    assert f"search-reduce[scudo] {SEARCH_REDUCE_ANDROID_VERSION} over 3 dump(s)" in err
+    assert f"search-reduce[scudo] {SCUDO_CANDIDATES_VERSION} over 3 dump(s)" in err
     funnel = {}
     for line in err.splitlines():
         if line.startswith("memdiver:   "):
