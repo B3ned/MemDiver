@@ -325,7 +325,7 @@ class HeapChunkIndex:
 
     def _arena_entry(self, i: int) -> Dict[str, str]:
         """``{"arena": kind}`` when the chunk's arena kind is known, else ``{}``."""
-        assert self.arena_kinds is not None  # set by __post_init__
+        assert self.arena_kinds is not None  # nosec B101 — set by __post_init__; narrows Optional for mypy
         return arena_entry(arena_kind_name(self.arena_kinds[i]))
 
     def to_arrays(self) -> Dict[str, np.ndarray]:
@@ -691,7 +691,7 @@ def _chunk_index(anchor: DumpHeapProjection,
     agree = _chunk_agreement(anchor, projections)
     keep = anchor.chunk_slabs >= 0
     order = np.argsort(anchor.chunk_slabs[keep], kind="stable")
-    assert anchor.chunk_arena_kinds is not None  # set by __post_init__
+    assert anchor.chunk_arena_kinds is not None  # nosec B101 — set by __post_init__; narrows Optional for mypy
     return HeapChunkIndex(anchor.chunk_slabs[keep][order],
                           anchor.chunk_sizes[keep][order],
                           anchor.chunk_states[keep][order],
