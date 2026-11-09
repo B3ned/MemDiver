@@ -4,21 +4,23 @@
 ``--state``) into ``candidates.json``, the region list ``brute-force`` walks.
 Across Android cold boots a positional consensus does not line up -- Scudo
 re-places every heap chunk each run (see
-:mod:`memdiver.engine.scudo_candidates`) -- so this producer backs the Scudo
-raw-dumps mode of ``search-reduce`` instead: it builds the chunk-signature
+:mod:`memdiver.engine.scudo_candidates`) -- so this producer backs
+``search-reduce`` for a Scudo session instead: it builds the chunk-signature
 consensus (:func:`~memdiver.engine.scudo_chunk_consensus.build_chunk_consensus`,
 content alignment on), gives every chunk of ONE reference dump a verdict
 (:func:`~memdiver.engine.scudo_candidates.classify_chunks`) and writes the kept
 chunks as ``candidates.json`` in the reference's flat ``"vas"`` view: the
 coordinates ``brute-force --dump <reference>`` slices its windows from.
 
-It is an internal helper behind the ``search-reduce`` command (selected by
-allocator detection, or ``--allocator scudo``), not a standalone capability.
+It is an internal helper behind the ``search-reduce`` command (selected by the
+kind of ``--state`` session), not a standalone capability.
 
 The chain it completes::
 
     memslicer <package> -U ...                                   # N cold-boot runs
-    memdiver search-reduce runs/*.msl --reference-dump runs/r1.msl --allocator scudo -o c1.json
+    memdiver consensus-begin --state s.json --allocator scudo
+    memdiver consensus-add --state s.json runs/r1.msl            # once per run
+    memdiver search-reduce --state s.json --reference-dump runs/r1.msl -o c1.json
     memdiver brute-force --candidates c1.json --dump runs/r1.msl --pcap r1.pcap \\
         --key-sizes 48 --stride 1 -o hits1.json
 
@@ -67,6 +69,8 @@ __all__ = [
     "INVALID_KEY_SIZES_CODE",
     "NOT_JUDGED_CODE",
     "NOT_MSL_CODE",
+    "PLUGIN_UNSUPPORTED_CODE",
+    "PLUGIN_UNSUPPORTED_MESSAGE",
     "REFERENCE_NOT_IN_DUMPS_CODE",
     "REFERENCE_TRUNCATED_CODE",
     "SCOPE_FALLBACK_CODE",
@@ -96,8 +100,22 @@ CANDIDATES_SKIPPED_CODE = "scudo.candidates_skipped"
 NOT_JUDGED_CODE = "scudo.not_judged"
 SCOPE_FALLBACK_CODE = "scudo.scope_fallback"
 #: The reference is not a Scudo heap (``--allocator`` named a non-Scudo
-#: allocator, or ``auto`` detected one): raw-dumps mode is Scudo-only.
+#: allocator, or ``auto`` detected one): a Scudo session reduces Scudo heaps only.
 WRONG_ALLOCATOR_CODE = "scudo.wrong_allocator"
+PLUGIN_UNSUPPORTED_CODE = "scudo.plugin_unsupported"
+
+PLUGIN_UNSUPPORTED_MESSAGE = (
+    "Volatility 3 plugin generation is not supported yet with the Android "
+    "Scudo method. A plugin is built from the per-byte variance around a hit, "
+    "and this method compares whole heap chunks across runs instead of byte "
+    "positions, so that data is not available."
+)
+
+#: The allocator is fixed when a session begins, so both ways out start a new one.
+_NEW_SESSION_HINT = (
+    "begin a session with consensus-begin --size for the generic (Welford) "
+    "pipeline, or with consensus-begin --allocator scudo to force the Scudo path"
+)
 
 #: Why a kept chunk did not become a region. Each is a translation guard that
 #: should never fire on an intact capture; a non-zero count is reported.
@@ -158,7 +176,7 @@ def _require_distinct_msl_files(paths: Sequence[str]) -> None:
         fmt = getattr(open_dump(path), "format_name", "")
         if fmt != "msl":
             raise UnsupportedFormatError(
-                f"{raw} is a {fmt or 'unrecognised'} dump; search-reduce-android "
+                f"{raw} is a {fmt or 'unrecognised'} dump; the Scudo method "
                 "reads native .msl dumps only (the Scudo scan needs their "
                 "region table and VAS map)", code=NOT_MSL_CODE)
 
@@ -206,12 +224,12 @@ def _require_scudo(reference_path: str, allocator: str,
                    km: Dict[str, Any]) -> None:
     """Refuse unless the reference dump is a Scudo heap.
 
-    ``search-reduce``'s raw-dumps mode only knows how to pair Scudo primary
+    A Scudo session only knows how to pair Scudo primary
     chunks across cold boots, so it is Scudo-only in this release.
     ``allocator="scudo"`` forces that path without probing; ``"auto"`` detects
     the allocator from the (decrypted) reference and requires Scudo; any other
-    allocator -- or ``"off"`` -- is refused with a pointer to ``--state`` (the
-    generic Welford pipeline) or ``--allocator scudo``. The name is validated
+    allocator -- or ``"off"`` -- is refused with a pointer to the two kinds of
+    session. The name is validated
     the way :func:`memdiver.app.tools_heap._checked_allocator` validates it, so
     a typo is an ``INVALID_INPUT`` refusal rather than a traceback.
     """
@@ -225,7 +243,7 @@ def _require_scudo(reference_path: str, allocator: str,
     if name not in ("auto", "scudo"):
         # A concrete non-Scudo allocator, "off", or a bad name. Surface an
         # unknown name as INVALID_INPUT (mirroring _checked_allocator); then
-        # refuse the mode -- raw-dumps reduction is Scudo-only.
+        # refuse the mode -- a Scudo session reduces Scudo heaps only.
         if name != "off":
             try:
                 parse_allocator_hint(name)
@@ -234,9 +252,8 @@ def _require_scudo(reference_path: str, allocator: str,
                     str(exc), category=ErrorCategory.INVALID_INPUT,
                     code=WRONG_ALLOCATOR_CODE) from exc
         raise CapabilityError(
-            f"search-reduce's raw-dumps mode reduces Android Scudo heaps only, "
-            f"but --allocator {name} was given; use --state for the generic "
-            "(Welford) pipeline, or --allocator scudo to force the Scudo path",
+            f"a Scudo session reduces Android Scudo heaps only, but its "
+            f"allocator is {name}; {_NEW_SESSION_HINT}",
             category=ErrorCategory.PRECONDITION, code=WRONG_ALLOCATOR_CODE)
 
     if name == "scudo":
@@ -249,9 +266,7 @@ def _require_scudo(reference_path: str, allocator: str,
         return
     raise CapabilityError(
         f"the reference dump's heap was detected as {detected.value}, not "
-        "Scudo; search-reduce's raw-dumps mode reduces Android Scudo heaps "
-        "only -- use --state for the generic (Welford) pipeline, or "
-        "--allocator scudo to force the Scudo path",
+        f"Scudo; a Scudo session reduces Android Scudo heaps only -- {_NEW_SESSION_HINT}",
         category=ErrorCategory.PRECONDITION, code=WRONG_ALLOCATOR_CODE,
         details={"detected": detected.value})
 
@@ -392,7 +407,7 @@ def _search_reduce_android(
 ) -> Dict[str, Any]:
     """Reduce N Android Scudo dumps to ``brute-force`` candidates of one reference.
 
-    Internal helper behind the ``search-reduce`` command's Scudo (raw-dumps)
+    Internal helper behind the ``search-reduce`` command's Scudo
     mode; not a registered capability (the command's capability covers it).
 
     Builds the chunk-signature consensus over ``dump_paths`` (content alignment

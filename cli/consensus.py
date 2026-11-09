@@ -498,7 +498,8 @@ def _consensus_add_scudo(state: dict, state_path: Path,
         print(f"Dump not found: {args.dump}", file=sys.stderr)
         return 1
     _guard_add_cohort(state, args)
-    state.setdefault("dump_paths", []).append(str(dump))
+    # search-reduce need not run from the directory this add ran in.
+    state.setdefault("dump_paths", []).append(str(dump.absolute()))
     state["num_dumps"] = int(state.get("num_dumps", 0)) + 1
     state_path.write_text(json.dumps(state, indent=2))
     print(f"[{state['num_dumps']}] collected {dump.name}")

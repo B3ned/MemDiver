@@ -156,6 +156,31 @@ def _search_reduce_generic(args: argparse.Namespace, allocator: str) -> int:
     return 0
 
 
+#: The positional reduction's flags. A Scudo session has no use for them.
+_POSITIONAL_REDUCE_FLAGS = (
+    "alignment", "block_size", "density_threshold", "min_variance",
+    "entropy_window", "entropy_threshold", "min_region", "max_region",
+    "classes", "order", "heap_policy", "allocator",
+)
+
+
+def _warn_ignored_positional_flags(args: argparse.Namespace) -> None:
+    """Say which flags a Scudo session ignores, rather than dropping them silently."""
+    from .main import _build_parser
+
+    defaults = _build_parser().parse_args(
+        ["search-reduce", "--state", "s", "--reference-dump", "r", "-o", "o"])
+    ignored = [
+        "--" + name.replace("_", "-")
+        for name in _POSITIONAL_REDUCE_FLAGS
+        if getattr(args, name, getattr(defaults, name)) != getattr(defaults, name)
+    ]
+    if ignored:
+        print(f"memdiver: WARNING — {', '.join(ignored)} only apply to the generic "
+              "(Welford) pipeline and are ignored for this Scudo session",
+              file=sys.stderr)
+
+
 def _search_reduce_scudo(args: argparse.Namespace, state: dict) -> int:
     """Reduce an Android Scudo collect session to candidates.json.
 
@@ -171,6 +196,7 @@ def _search_reduce_scudo(args: argparse.Namespace, state: dict) -> int:
 
     from ._scudo_report import print_scudo_funnel
 
+    _warn_ignored_positional_flags(args)
     raw_sizes = getattr(args, "key_sizes", "32") or "32"
     if isinstance(raw_sizes, str):
         key_sizes = [k.strip() for k in raw_sizes.split(",") if k.strip()]
@@ -246,6 +272,33 @@ def _cmd_analyze_candidates(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refuse_scudo_session_as_state(state_path: Optional[str]) -> None:
+    """Refuse a Scudo session as ``brute-force --state`` before the search runs.
+
+    ``--state`` attaches the variance a plugin is built from, which a Scudo
+    session does not have, so the search would run and lead nowhere. A state
+    this cannot read keeps its old treatment: one warning per hit.
+    """
+    from memdiver.app.tools_pipeline_android import (
+        PLUGIN_UNSUPPORTED_CODE,
+        PLUGIN_UNSUPPORTED_MESSAGE,
+    )
+
+    from .consensus import STATE_MODE_SCUDO, _load_consensus_state
+
+    if not state_path:
+        return
+    try:
+        mode, _state = _load_consensus_state(Path(state_path))
+    except (OSError, ValueError, CapabilityError):
+        return
+    if mode == STATE_MODE_SCUDO:
+        raise CapabilityError(
+            f"{PLUGIN_UNSUPPORTED_MESSAGE} Run brute-force without --state to "
+            "verify the candidates.",
+            category=ErrorCategory.INVALID_INPUT, code=PLUGIN_UNSUPPORTED_CODE)
+
+
 def _cmd_brute_force(args: argparse.Namespace) -> int:
     """Iterate candidates through a user oracle and emit hits.json.
 
@@ -261,6 +314,7 @@ def _cmd_brute_force(args: argparse.Namespace) -> int:
     from memdiver.app.tools_pipeline import DEFAULT_RESOURCE_TYPE, brute_force
     from memdiver.engine.brute_force import DEFAULT_NEIGHBORHOOD_PAD
 
+    _refuse_scudo_session_as_state(args.state)
     key_sizes = tuple(int(k.strip()) for k in args.key_sizes.split(",") if k.strip())
     with tempfile.TemporaryDirectory() as scratch:
         result = brute_force(

@@ -276,7 +276,12 @@ memdiver brute-force --candidates cand.json --dump rnd-1.msl --pcap "$PWD/rnd-1.
 
 `--key-sizes` only sizes the reported window estimate; it never filters a
 region. A short funnel — how the reference's chunks were judged, what is kept,
-what could not be judged — goes to stderr.
+what could not be judged — goes to stderr. The positional flags such as
+`--min-variance` do not apply to a Scudo session and are reported as ignored.
+
+The chain ends at `brute-force`. Volatility 3 plugin generation is not supported
+yet with this method: a plugin is built from the per-byte variance around a hit,
+and this method compares whole heap chunks across runs instead of byte positions.
 
 ## Importing only some regions
 

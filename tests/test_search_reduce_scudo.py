@@ -42,6 +42,7 @@ from memdiver.app.tools_pipeline_android import (  # noqa: E402
     INVALID_KEY_SIZES_CODE,
     NOT_JUDGED_CODE,
     NOT_MSL_CODE,
+    PLUGIN_UNSUPPORTED_CODE,
     REFERENCE_NOT_IN_DUMPS_CODE,
     REFERENCE_TRUNCATED_CODE,
     SCOPE_FALLBACK_CODE,
@@ -1070,3 +1071,159 @@ def test_cli_pipeline_finalize_reports_the_collected_session(
     assert report["allocator"] == "scudo"
     assert report["num_dumps"] == N_RUNS
     assert report["dump_paths"] == list(scudo_runs)
+
+
+# ---------------------------------------------------------------------------
+# What a user of the CLI chain runs into
+# ---------------------------------------------------------------------------
+
+
+def test_a_session_survives_a_change_of_directory(scudo_runs, tmp_path, monkeypatch):
+    from memdiver.cli.consensus import _cmd_consensus_add, _cmd_consensus_begin
+    from memdiver.cli.pipeline import _cmd_search_reduce
+
+    state = tmp_path / "s.json"
+    monkeypatch.chdir(Path(scudo_runs[0]).parent)
+    assert _cmd_consensus_begin(_parse([
+        "consensus-begin", "--state", str(state), "--allocator", "scudo"])) == 0
+    for path in scudo_runs:
+        assert _cmd_consensus_add(
+            _parse(["consensus-add", "--state", str(state), Path(path).name])) == 0
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    out = tmp_path / "candidates.json"
+    assert _cmd_search_reduce(_parse([
+        "search-reduce", "--state", str(state), "--reference-dump", scudo_runs[1],
+        "--key-sizes", str(SECRET_SIZE), "-o", str(out)])) == 0
+    (region,) = json.loads(out.read_text())["regions"]
+    assert int(region["va"], 16) == secret_user_va(1)
+
+
+def test_a_non_msl_refusal_names_no_command_that_does_not_exist(scudo_runs, tmp_path):
+    raw = tmp_path / "raw.bin"
+    raw.write_bytes(b"\x00" * 64)
+    message = _refused([*scudo_runs, str(raw)], scudo_runs[0], tmp_path).message
+    assert "search-reduce-android" not in message
+    assert ".msl" in message
+
+
+@pytest.mark.parametrize("allocator", ["auto", "ptmalloc2", "off"])
+def test_a_wrong_heap_refusal_points_at_consensus_begin(
+    scudo_runs, tmp_path, monkeypatch, allocator,
+):
+    import memdiver.heap.detect as detect
+    from memdiver.heap.model import AllocatorKind
+
+    monkeypatch.setattr(detect, "detect_allocator", _fake_detection(AllocatorKind.PTMALLOC2))
+    refusal = _refused(scudo_runs, scudo_runs[0], tmp_path, allocator=allocator)
+
+    assert refusal.code == WRONG_ALLOCATOR_CODE
+    assert "consensus-begin --size" in refusal.message
+    assert "consensus-begin --allocator scudo" in refusal.message
+    assert "raw-dumps" not in refusal.message
+
+
+def _brute_force_argv(candidates, dump, oracle, out, *extra):
+    return ["brute-force", "--candidates", candidates, "--dump", dump, "--oracle", oracle,
+            "--key-sizes", str(SECRET_SIZE), "--stride", "1", "--jobs", "1",
+            "-o", str(out), *extra]
+
+
+def test_brute_force_refuses_a_scudo_session_as_its_state(scudo_runs, tmp_path, monkeypatch):
+    """Following the old plugin error led to the same error, after the whole search."""
+    from memdiver.cli.pipeline import _cmd_brute_force
+
+    state = _begin_and_collect(monkeypatch, tmp_path, scudo_runs)
+    result, _cand = _reduce(scudo_runs, tmp_path)
+    out = tmp_path / "hits.json"
+
+    with pytest.raises(CapabilityError) as refused:
+        _cmd_brute_force(_parse(_brute_force_argv(
+            result["candidates_path"], scudo_runs[0],
+            _oracle(tmp_path, secret_value(0)), out, "--state", str(state))))
+
+    assert refused.value.code == PLUGIN_UNSUPPORTED_CODE
+    assert "not supported yet" in refused.value.message
+    assert "without --state" in refused.value.message
+    assert not out.exists()
+
+
+def test_brute_force_still_runs_without_a_state(scudo_runs, tmp_path):
+    from memdiver.cli.pipeline import _cmd_brute_force
+
+    result, _cand = _reduce(scudo_runs, tmp_path)
+    out = tmp_path / "hits.json"
+
+    assert _cmd_brute_force(_parse(_brute_force_argv(
+        result["candidates_path"], scudo_runs[0],
+        _oracle(tmp_path, secret_value(0)), out))) == 0
+    assert len(json.loads(out.read_text())["hits"]) == 1
+
+
+def test_an_unreadable_state_keeps_its_old_treatment(scudo_runs, tmp_path):
+    from memdiver.cli.pipeline import _cmd_brute_force
+
+    result, _cand = _reduce(scudo_runs, tmp_path)
+    out = tmp_path / "hits.json"
+
+    assert _cmd_brute_force(_parse(_brute_force_argv(
+        result["candidates_path"], scudo_runs[0], _oracle(tmp_path, secret_value(0)),
+        out, "--state", str(tmp_path / "missing.json")))) == 0
+    assert len(json.loads(out.read_text())["hits"]) == 1
+
+
+def test_emit_plugin_says_why_a_scudo_hit_cannot_become_one(tmp_path):
+    from memdiver.engine.vol3_emit import emit_plugin_for_hit
+
+    hit = {"offset": 16, "neighborhood_start": 16, "neighborhood_variance": []}
+    with pytest.raises(ValueError, match="not supported yet with that method"):
+        emit_plugin_for_hit(hit, bytes(64), "p", tmp_path / "p.py")
+
+
+def _search_reduce_argv(state, reference, out, *extra):
+    return ["search-reduce", "--state", str(state), "--reference-dump", reference,
+            "--key-sizes", str(SECRET_SIZE), "-o", str(out), *extra]
+
+
+def test_positional_flags_on_a_scudo_session_are_reported(
+    scudo_runs, tmp_path, monkeypatch, capsys,
+):
+    from memdiver.cli.pipeline import _cmd_search_reduce
+
+    state = _begin_and_collect(monkeypatch, tmp_path, scudo_runs)
+    capsys.readouterr()
+
+    assert _cmd_search_reduce(_parse(_search_reduce_argv(
+        state, scudo_runs[0], tmp_path / "c.json",
+        "--min-variance", "999999", "--heap-policy", "mask"))) == 0
+
+    err = capsys.readouterr().err
+    assert "--min-variance, --heap-policy only apply to the generic" in err
+
+
+def test_search_reduce_allocator_on_a_scudo_session_is_reported(
+    scudo_runs, tmp_path, monkeypatch, capsys,
+):
+    from memdiver.cli.pipeline import _cmd_search_reduce
+
+    state = _begin_and_collect(monkeypatch, tmp_path, scudo_runs)
+    capsys.readouterr()
+
+    assert _cmd_search_reduce(_parse(_search_reduce_argv(
+        state, scudo_runs[0], tmp_path / "c.json", "--allocator", "ptmalloc2"))) == 0
+
+    assert "--allocator only apply to the generic" in capsys.readouterr().err
+
+
+def test_an_untouched_command_warns_about_nothing(scudo_runs, tmp_path, monkeypatch, capsys):
+    from memdiver.cli.pipeline import _cmd_search_reduce
+
+    state = _begin_and_collect(monkeypatch, tmp_path, scudo_runs)
+    capsys.readouterr()
+
+    assert _cmd_search_reduce(_parse(_search_reduce_argv(
+        state, scudo_runs[0], tmp_path / "c.json"))) == 0
+
+    assert "only apply to the generic" not in capsys.readouterr().err

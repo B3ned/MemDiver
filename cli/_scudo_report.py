@@ -1,4 +1,4 @@
-"""The stderr funnel for ``search-reduce``'s Scudo (raw-dumps) mode.
+"""The stderr funnel for ``search-reduce``'s Scudo mode.
 
 A thin presenter over the summary
 :func:`memdiver.app.tools_pipeline_android._search_reduce_android` returns: the

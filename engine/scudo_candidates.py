@@ -268,7 +268,7 @@ def classify_chunks(
                 f"chunk {chunk.sig} at {chunk.user_va:#x} in dump {dump_index} "
                 "is neither paired, dynamic, missing nor ambiguous -- the chunk "
                 "consensus is inconsistent")
-    logger.info("search-reduce-android: dump %d: %s", dump_index,
+    logger.info("search-reduce[scudo]: dump %d: %s", dump_index,
                 dict(Counter(v.verdict for v in verdicts)))
     return verdicts
 
