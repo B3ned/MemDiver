@@ -73,6 +73,7 @@ from ._shared import (
     add_heap_policy_argument,
     add_keylog_anchor_arguments,
     add_mixed_ok_argument,
+    CONSENSUS_BEGIN_ALLOCATOR_CHOICES,
     SEARCH_REDUCE_ALLOCATOR_CHOICES,
     to_cli_exit,
 )
@@ -233,17 +234,30 @@ def _build_parser() -> argparse.ArgumentParser:
     # incremental consensus (Welford-backed, persisted state)
     cb = sub.add_parser(
         "consensus-begin",
-        help="Create a new incremental consensus session on disk",
+        help="Create a new consensus session on disk (generic Welford, or "
+             "Android Scudo collect)",
     )
     cb.add_argument("--state", required=True, help="Path to session state JSON")
-    cb.add_argument("--size", type=int, required=True,
-                    help="Consensus width in bytes")
+    cb.add_argument("--size", type=int, default=None,
+                    help="Consensus width in bytes (generic/Welford pipeline). "
+                         "Omit and pass --allocator scudo/auto for the Android "
+                         "Scudo pipeline; mutually exclusive with "
+                         "--allocator scudo.")
     cb.add_argument("dumps", nargs="*",
                     help="Optional dumps the session will be fed: their "
                          "experiment cohort is recorded and enforced by "
                          "consensus-add")
+    # None = flag omitted: _cmd_consensus_begin refuses a call with neither
+    # --size nor --allocator, and a --size session then records heap roles as auto.
+    add_allocator_argument(
+        cb, choices=CONSENSUS_BEGIN_ALLOCATOR_CHOICES, default=None,
+        help_text="With --size: heap allocator whose per-dump projections feed "
+                  "search-reduce (auto, ptmalloc2 or off; default auto). "
+                  "Without --size: selects the Android Scudo pipeline, where "
+                  "'scudo' forces it and 'auto' defers to memdiver's allocator "
+                  "detection on the reference dump at search-reduce time and "
+                  "requires Scudo. 'scudo' and --size are mutually exclusive.")
     add_mixed_ok_argument(cb)
-    add_allocator_argument(cb, choices=SEARCH_REDUCE_ALLOCATOR_CHOICES)
     cb.add_argument("-v", "--verbose", action="store_true")
     ca = sub.add_parser(
         "consensus-add",
@@ -438,12 +452,20 @@ def _build_parser() -> argparse.ArgumentParser:
     # search-reduce
     sr = sub.add_parser(
         "search-reduce",
-        help="Reduce candidate set: variance → alignment → entropy",
+        help="Reduce candidate set: variance → alignment → entropy "
+             "(generic/Welford), or an Android Scudo heap session",
         parents=[_decrypt_parent_parser()],
     )
-    sr.add_argument("--state", required=True, help="Path to consensus state JSON")
+    sr.add_argument("--state", required=True,
+                    help="Path to a consensus state JSON: a generic (Welford) "
+                         "session, or an Android Scudo collect session "
+                         "(consensus-begin --allocator scudo/auto). The state's "
+                         "kind selects the pipeline.")
     sr.add_argument("--reference-dump", required=True,
-                    help="One dump file used for per-region entropy sampling")
+                    help="One dump file used for per-region entropy sampling "
+                         "(generic), or the dump brute-force will read and whose "
+                         "flat 'vas' offsets the regions are in (Scudo; must be "
+                         "one of the collected dumps)")
     sr.add_argument("--alignment", type=int, default=8)
     sr.add_argument("--block-size", type=int, default=32)
     sr.add_argument("--density-threshold", type=float, default=0.5)
@@ -466,19 +488,29 @@ def _build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--order", choices=("offset", "rank"), default="offset",
                     help="Order of the emitted regions (default offset). Every "
                          "region carries 'rank' and 'score' either way.")
+    sr.add_argument("--key-sizes", default="32",
+                    help="Scudo session only: comma-separated key sizes for the "
+                         "reported window estimate (never filters; default 32, "
+                         "brute-force's default; 48 for TLS_AES_256_GCM_SHA384). "
+                         "Ignored by the generic/Welford path.")
     sr.add_argument("-o", "--output", required=True, help="Output candidates.json")
     sr.add_argument("-v", "--verbose", action="store_true")
     # Heap roles come from the --state session's per-dump projections
-    # (consensus-begin --allocator auto|ptmalloc2), else from the reference
-    # dump alone; --allocator off keeps the historical payload.
+    # (consensus-begin --size N --allocator auto|ptmalloc2), else from the
+    # reference dump alone; --allocator off keeps the historical payload.
     add_allocator_argument(
         sr, choices=SEARCH_REDUCE_ALLOCATOR_CHOICES,
         help_text="Heap allocator for heap-aware reduction (default: auto). "
                   "Uses the session's merged heap projections when "
                   "consensus-begin recorded them, else analyses the "
                   "--reference-dump alone; ptmalloc2 only. 'off' disables "
-                  "heap analysis (and is refused with --heap-policy mask)")
+                  "heap analysis (and is refused with --heap-policy mask). "
+                  "Ignored for an Android Scudo session, whose state fixes "
+                  "the allocator.")
     add_heap_policy_argument(sr)
+    # Scudo session only: lift the cohort.mixed refusal when the collected dumps
+    # span experiment cohorts on purpose. Ignored by the generic/Welford path.
+    add_mixed_ok_argument(sr)
     # analyze-candidates (the exploratory path: no oracle, no capture)
     ac = sub.add_parser(
         "analyze-candidates",

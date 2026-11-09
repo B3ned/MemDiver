@@ -70,6 +70,12 @@ PIPELINE_ALLOCATOR_CHOICES = ALLOCATOR_CHOICES + ("off",)
 #: this module depends only on ``core`` so it cannot import ``heap``).
 SEARCH_REDUCE_ALLOCATOR_CHOICES = ("auto", "ptmalloc2", "off")
 
+#: ``--allocator`` choices on ``consensus-begin``. A ``--size`` session takes the
+#: reduce-ready names above; ``scudo`` (or ``auto`` without ``--size``) selects
+#: the Android Scudo collect session. ``scudo`` stays out of the set above: that
+#: pipeline pairs whole chunks and does not use heap-role reduction.
+CONSENSUS_BEGIN_ALLOCATOR_CHOICES = SEARCH_REDUCE_ALLOCATOR_CHOICES + ("scudo",)
+
 #: ``--heap-policy`` choices (``engine.candidate_pipeline.HEAP_POLICIES``).
 HEAP_POLICY_CHOICES = ("off", "annotate", "mask")
 
@@ -80,9 +86,15 @@ _ALLOCATOR_HELP = ("Heap allocator for the non-destructive heap-role annotation 
 
 def add_allocator_argument(parser: argparse.ArgumentParser,
                            choices: "tuple[str, ...]" = PIPELINE_ALLOCATOR_CHOICES,
-                           help_text: str = _ALLOCATOR_HELP) -> None:
-    """Register ``--allocator`` (heap-role annotation of the consensus)."""
-    parser.add_argument("--allocator", choices=choices, default="auto",
+                           help_text: str = _ALLOCATOR_HELP,
+                           default: "str | None" = "auto") -> None:
+    """Register ``--allocator`` (heap-role annotation of the consensus).
+
+    ``default=None`` is for a command that must tell an omitted flag from an
+    explicit ``auto`` (``consensus-begin``, where the flag can select the Scudo
+    pipeline); every other caller keeps the auto-detect default.
+    """
+    parser.add_argument("--allocator", choices=choices, default=default,
                         help=help_text)
 
 

@@ -101,10 +101,14 @@ def test_search_reduce_allocator_choices_match_reduce_ready_kinds():
 
 def test_consensus_begin_allocator_choices(capsys):
     base = ["consensus-begin", "--state", "s.json", "--size", "16"]
-    assert _parse(base).allocator == "auto"
+    # None = omitted; the handler records heap roles as auto for a --size session.
+    assert _parse(base).allocator is None
     assert _parse([*base, "--allocator", "off"]).allocator == "off"
+    # 'scudo' parses because it selects the Scudo session; the handler refuses it
+    # next to --size. Other names that are not reduce-ready stop at the parser.
+    assert _parse([*base, "--allocator", "scudo"]).allocator == "scudo"
     with pytest.raises(SystemExit):
-        _parse([*base, "--allocator", "scudo"])
+        _parse([*base, "--allocator", "dlmalloc"])
     capsys.readouterr()
 
 
