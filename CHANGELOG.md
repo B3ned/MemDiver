@@ -32,6 +32,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   coverage keys. `AllocatorDescriptor.reduce_ready` / `reduce_ready_kinds()` gate which
   allocators `search-reduce` accepts (parity with the CLI choices is test-guarded). See
   `docs/contributing/adding_allocator.md`.
+- `search-reduce` reduces Android Scudo heap dumps across cold boots: `consensus-begin --allocator scudo|auto` without `--size` collects the runs and `search-reduce --state` pairs their heap chunks by allocator signature and content. The chain ends at `brute-force`: Volatility 3 plugin generation is not supported yet with this method.
 
 ### Changed
 - The `heap_policy='mask'` precondition error names the unavailable status and its

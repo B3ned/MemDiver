@@ -65,6 +65,34 @@ def _split_classes(spec):
 
 
 def _cmd_search_reduce(args: argparse.Namespace) -> int:
+    """Reduce a consensus session to ``candidates.json`` for ``brute-force``.
+
+    One input shape -- ``--state`` -- drives both pipelines; the state's own
+    kind selects which:
+
+    * a generic (Welford) session -> variance → alignment → entropy
+      (:func:`app.tools_pipeline.search_reduce`).
+    * an Android Scudo collect session -> pair heap chunks by allocator
+      signature + content across cold boots and keep the reference's
+      per-run-value chunks
+      (:func:`app.tools_pipeline_android.search_reduce_android`), with the
+      allocator resolved from the session (``scudo`` forces, ``auto`` detects on
+      the reference via memdiver's allocator detection).
+
+    Both write the identical ``candidates.json`` contract, so the command's CLI
+    surface (``--state --reference-dump -o``) is the same for either pipeline.
+    """
+    from .consensus import STATE_MODE_SCUDO, _load_consensus_state
+
+    # A contradictory flag pair is refused before any work, whatever the session.
+    allocator = effective_allocator(args)
+    mode, state = _load_consensus_state(Path(args.state))
+    if mode == STATE_MODE_SCUDO:
+        return _search_reduce_scudo(args, state)
+    return _search_reduce_generic(args, allocator)
+
+
+def _search_reduce_generic(args: argparse.Namespace, allocator: str) -> int:
     """Run variance → alignment → entropy reduction on a finalized session.
 
     Routes the compute through ``app.tools_pipeline.search_reduce`` — the same
@@ -92,7 +120,6 @@ def _cmd_search_reduce(args: argparse.Namespace) -> int:
 
     from memdiver.app.tools_pipeline import search_reduce
 
-    allocator = effective_allocator(args)
     state, welford = _load_welford_session(Path(args.state))
     variance = welford.variance()
 
@@ -126,6 +153,72 @@ def _cmd_search_reduce(args: argparse.Namespace) -> int:
     attach_reduce_heap(payload, heap, allocator)
     report_candidate_heap(payload, heap)
     _write_output(payload, args.output)
+    return 0
+
+
+#: The positional reduction's flags. A Scudo session has no use for them.
+_POSITIONAL_REDUCE_FLAGS = (
+    "alignment", "block_size", "density_threshold", "min_variance",
+    "entropy_window", "entropy_threshold", "min_region", "max_region",
+    "classes", "order", "heap_policy", "allocator",
+)
+
+
+def _warn_ignored_positional_flags(args: argparse.Namespace) -> None:
+    """Say which flags a Scudo session ignores, rather than dropping them silently."""
+    from .main import _build_parser
+
+    defaults = _build_parser().parse_args(
+        ["search-reduce", "--state", "s", "--reference-dump", "r", "-o", "o"])
+    ignored = [
+        "--" + name.replace("_", "-")
+        for name in _POSITIONAL_REDUCE_FLAGS
+        if getattr(args, name, getattr(defaults, name)) != getattr(defaults, name)
+    ]
+    if ignored:
+        print(f"memdiver: WARNING — {', '.join(ignored)} only apply to the generic "
+              "(Welford) pipeline and are ignored for this Scudo session",
+              file=sys.stderr)
+
+
+def _search_reduce_scudo(args: argparse.Namespace, state: dict) -> int:
+    """Reduce an Android Scudo collect session to candidates.json.
+
+    Feeds the paths collected by consensus-add to the Scudo chunk-consensus
+    producer, which resolves the allocator from the session (``scudo`` forces,
+    ``auto`` detects Scudo on the reference via memdiver's allocator detection),
+    relays the written candidates.json to --output and prints the funnel. A
+    refusal propagates as a CapabilityError to the dispatcher's backstop.
+    """
+    import tempfile
+
+    from memdiver.app.tools_pipeline_android import search_reduce_android
+
+    from ._scudo_report import print_scudo_funnel
+
+    _warn_ignored_positional_flags(args)
+    raw_sizes = getattr(args, "key_sizes", "32") or "32"
+    if isinstance(raw_sizes, str):
+        key_sizes = [k.strip() for k in raw_sizes.split(",") if k.strip()]
+    else:
+        key_sizes = list(raw_sizes)
+    dump_paths = [str(p) for p in (state.get("dump_paths") or [])]
+    with tempfile.TemporaryDirectory() as scratch:
+        result = search_reduce_android(
+            dump_paths=dump_paths,
+            reference_path=args.reference_dump,
+            output_dir=scratch,
+            key_sizes=key_sizes,
+            key_file=args.key_file,
+            passphrase=args.passphrase,
+            kem_key_file=args.kem_key_file,
+            allocator=state.get("allocator", "auto"),
+            mixed_ok=getattr(args, "mixed_ok", False),
+            on_source=_warn_tag_status,
+        )
+        payload = json.loads(Path(result["candidates_path"]).read_text())
+    _write_output(payload, args.output)
+    print_scudo_funnel(result, args.output)
     return 0
 
 
@@ -179,6 +272,33 @@ def _cmd_analyze_candidates(args: argparse.Namespace) -> int:
     return 0
 
 
+def _refuse_scudo_session_as_state(state_path: Optional[str]) -> None:
+    """Refuse a Scudo session as ``brute-force --state`` before the search runs.
+
+    ``--state`` attaches the variance a plugin is built from, which a Scudo
+    session does not have, so the search would run and lead nowhere. A state
+    this cannot read keeps its old treatment: one warning per hit.
+    """
+    from memdiver.app.tools_pipeline_android import (
+        PLUGIN_UNSUPPORTED_CODE,
+        PLUGIN_UNSUPPORTED_MESSAGE,
+    )
+
+    from .consensus import STATE_MODE_SCUDO, _load_consensus_state
+
+    if not state_path:
+        return
+    try:
+        mode, _state = _load_consensus_state(Path(state_path))
+    except (OSError, ValueError, CapabilityError):
+        return
+    if mode == STATE_MODE_SCUDO:
+        raise CapabilityError(
+            f"{PLUGIN_UNSUPPORTED_MESSAGE} Run brute-force without --state to "
+            "verify the candidates.",
+            category=ErrorCategory.INVALID_INPUT, code=PLUGIN_UNSUPPORTED_CODE)
+
+
 def _cmd_brute_force(args: argparse.Namespace) -> int:
     """Iterate candidates through a user oracle and emit hits.json.
 
@@ -194,6 +314,7 @@ def _cmd_brute_force(args: argparse.Namespace) -> int:
     from memdiver.app.tools_pipeline import DEFAULT_RESOURCE_TYPE, brute_force
     from memdiver.engine.brute_force import DEFAULT_NEIGHBORHOOD_PAD
 
+    _refuse_scudo_session_as_state(args.state)
     key_sizes = tuple(int(k.strip()) for k in args.key_sizes.split(",") if k.strip())
     with tempfile.TemporaryDirectory() as scratch:
         result = brute_force(

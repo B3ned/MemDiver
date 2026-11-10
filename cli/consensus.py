@@ -203,8 +203,105 @@ def _load_welford_session(state_path: Path):
     return state, welford
 
 
+# --------------------------------------------------------------------------
+# Session-kind discriminant (generic Welford vs. Android Scudo collect)
+# --------------------------------------------------------------------------
+
+#: The two persisted consensus-session kinds.
+STATE_MODE_WELFORD = "welford"
+STATE_MODE_SCUDO = "scudo"
+
+
+def _consensus_state_mode(state: dict) -> str:
+    """Which pipeline a persisted consensus state belongs to.
+
+    The generic (Welford) state carries ``mean_path``/``m2_path`` and a fixed
+    ``size``; the Android Scudo collect state carries an ``allocator`` and a
+    ``dump_paths`` list and no Welford arrays. Exactly one discriminator is
+    present in a well-formed state.
+    """
+    from memdiver.core.service_errors import CapabilityError, ErrorCategory
+
+    if "mean_path" in state:
+        return STATE_MODE_WELFORD
+    if state.get("allocator") or "dump_paths" in state:
+        return STATE_MODE_SCUDO
+    raise CapabilityError(
+        "consensus state is neither a generic (Welford) session (no mean_path) "
+        "nor an Android Scudo session (no allocator/dump_paths); re-create it "
+        "with consensus-begin",
+        category=ErrorCategory.INVALID_INPUT,
+        code="consensus.state_unrecognized")
+
+
+def _load_consensus_state(state_path: Path) -> "tuple[str, dict]":
+    """``(mode, state)`` for a persisted consensus session.
+
+    The ONE place that knows the state-shape discriminant; every consensus
+    command dispatches on the returned mode. The Welford arrays are NOT loaded
+    here (the Scudo branch never needs them) -- the Welford branch loads them
+    with :func:`_load_welford_session` as before.
+    """
+    state = json.loads(Path(state_path).read_text())
+    return _consensus_state_mode(state), state
+
+
 def _cmd_consensus_begin(args: argparse.Namespace) -> int:
-    """Create a new incremental consensus session persisted on disk."""
+    """Create a new consensus session persisted on disk.
+
+    Two session kinds, chosen at begin:
+
+    * ``--size N`` -> the generic (Welford) session: a fixed-width variance
+      accumulator folded one dump at a time by consensus-add.
+    * ``--allocator scudo`` / ``--allocator auto`` (no ``--size``) -> the
+      Android Scudo collect session. Scudo chunk alignment is cohort-global
+      (every dump is needed at once), so it cannot be folded incrementally;
+      consensus-add only records each dump's path and search-reduce aligns them.
+      ``scudo`` forces the Scudo path; ``auto`` defers to memdiver's allocator
+      detection on the reference at search-reduce time.
+
+    ``--size`` and ``--allocator scudo`` are mutually exclusive (a Scudo session
+    has no fixed consensus width).
+    """
+    from memdiver.core.service_errors import CapabilityError, ErrorCategory
+
+    allocator = getattr(args, "allocator", None)
+    size = getattr(args, "size", None)
+
+    if size is not None:
+        if allocator == "scudo":
+            raise CapabilityError(
+                "--size and --allocator scudo are mutually exclusive: the "
+                "Scudo pipeline aligns heap chunks across all dumps at "
+                "search-reduce time and has no fixed consensus width. Use "
+                "--size for the generic (Welford) pipeline, or --allocator "
+                "scudo on its own for the Scudo pipeline.",
+                category=ErrorCategory.INVALID_INPUT,
+                code="consensus.size_allocator_xor")
+        return _consensus_begin_welford(args)
+
+    # No --size: a Scudo collect session, which needs an explicit Scudo-family
+    # allocator (the generic pipeline is the one that needs --size).
+    if allocator in ("scudo", "auto"):
+        return _consensus_begin_scudo(args, allocator)
+    if allocator is None:
+        raise CapabilityError(
+            "consensus-begin needs either --size (the generic Welford "
+            "pipeline) or --allocator scudo / --allocator auto (the Android "
+            "Scudo pipeline).",
+            category=ErrorCategory.INVALID_INPUT,
+            code="consensus.mode_required")
+    raise CapabilityError(
+        f"--allocator {allocator} without --size is not a Scudo session; the "
+        "Scudo pipeline reduces Scudo heaps only, so pass --allocator scudo "
+        "(force) or --allocator auto (detect on the reference), or add --size "
+        "for the generic (Welford) pipeline.",
+        category=ErrorCategory.INVALID_INPUT,
+        code="consensus.bad_scudo_allocator")
+
+
+def _consensus_begin_welford(args: argparse.Namespace) -> int:
+    """Create a generic (Welford) incremental consensus session on disk."""
     import numpy as np
 
     from memdiver.app.welford_heap import begin_session_heap, reset_session_heap_dir
@@ -230,12 +327,44 @@ def _cmd_consensus_begin(args: argparse.Namespace) -> int:
     }
     if cohort is not None:
         state["cohort"] = cohort
-    # Hand-built Namespaces without --allocator keep the historical state.
-    begin_session_heap(state, getattr(args, "allocator", "off"))
+    # Hand-built Namespaces without --allocator keep the historical state; None
+    # is the parser's "flag omitted", which records heap roles as auto.
+    allocator = getattr(args, "allocator", "off")
+    begin_session_heap(state, "auto" if allocator is None else allocator)
     # A reused --state path must not merge projections of a previous session.
     reset_session_heap_dir(state_path)
     state_path.write_text(json.dumps(state, indent=2))
     print(f"Begun consensus session: size={args.size} state={state_path}")
+    return 0
+
+
+def _consensus_begin_scudo(args: argparse.Namespace, allocator: str) -> int:
+    """Create an Android Scudo collect session on disk.
+
+    Records only the cohort of any dumps named at begin (as the Welford path
+    does) and an empty ``dump_paths`` list; consensus-add appends to it. No
+    Welford arrays and no ``size`` -- Scudo alignment is cohort-global and
+    happens at search-reduce. ``allocator`` is ``scudo`` (forced) or ``auto``
+    (detected on the reference at search-reduce via memdiver's allocator
+    detection).
+    """
+    from memdiver.engine.cohorts import require_single_cohort
+
+    state_path = Path(args.state)
+    cohort = require_single_cohort(
+        [str(p) for p in (getattr(args, "dumps", None) or [])],
+        mixed_ok=getattr(args, "mixed_ok", False))
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state = {
+        "allocator": allocator,
+        "num_dumps": 0,
+        "dump_paths": [],
+    }
+    if cohort is not None:
+        state["cohort"] = cohort
+    state_path.write_text(json.dumps(state, indent=2))
+    print(f"Begun Scudo consensus session (allocator={allocator}): "
+          f"state={state_path}")
     return 0
 
 
@@ -295,7 +424,21 @@ def _guard_add_cohort(state: dict, args: argparse.Namespace) -> None:
 
 
 def _cmd_consensus_add(args: argparse.Namespace) -> int:
-    """Fold one dump into an existing incremental consensus session."""
+    """Fold or collect one dump into an existing consensus session.
+
+    Dispatches on the session kind: a generic (Welford) session folds the dump
+    into its variance accumulator; a Scudo collect session only records the
+    dump's path (Scudo alignment is cohort-global and deferred to
+    search-reduce).
+    """
+    mode, state = _load_consensus_state(Path(args.state))
+    if mode == STATE_MODE_SCUDO:
+        return _consensus_add_scudo(state, Path(args.state), args)
+    return _consensus_add_welford(args)
+
+
+def _consensus_add_welford(args: argparse.Namespace) -> int:
+    """Fold one dump into a generic (Welford) incremental consensus session."""
     import numpy as np
 
     from memdiver.app.composition import open_dump
@@ -341,7 +484,42 @@ def _cmd_consensus_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def _consensus_add_scudo(state: dict, state_path: Path,
+                         args: argparse.Namespace) -> int:
+    """Record one dump's path in a Scudo collect session.
+
+    No heap read and no fold: Scudo chunk alignment needs every dump at once, so
+    search-reduce does the work. The cohort guard (meta.json only, no heap read)
+    still runs, so a dump from another experiment cohort is refused here before
+    it can silently join the set.
+    """
+    dump = Path(args.dump)
+    if not dump.is_file():
+        print(f"Dump not found: {args.dump}", file=sys.stderr)
+        return 1
+    _guard_add_cohort(state, args)
+    # search-reduce need not run from the directory this add ran in.
+    state.setdefault("dump_paths", []).append(str(dump.absolute()))
+    state["num_dumps"] = int(state.get("num_dumps", 0)) + 1
+    state_path.write_text(json.dumps(state, indent=2))
+    print(f"[{state['num_dumps']}] collected {dump.name}")
+    return 0
+
+
 def _cmd_consensus_finalize(args: argparse.Namespace) -> int:
+    """Materialize a session's summary report.
+
+    Generic (Welford) sessions report variance + classification counts; Scudo
+    collect sessions report the collected set (the candidate reduction itself is
+    search-reduce's job, which needs a reference dump).
+    """
+    mode, state = _load_consensus_state(Path(args.state))
+    if mode == STATE_MODE_SCUDO:
+        return _consensus_finalize_scudo(state, args)
+    return _consensus_finalize_welford(args)
+
+
+def _consensus_finalize_welford(args: argparse.Namespace) -> int:
     """Materialize variance + classifications from a persisted session."""
     from memdiver.app.welford_heap import session_heap_summary
     from memdiver.core.variance import classify_variance, count_classifications
@@ -367,6 +545,28 @@ def _cmd_consensus_finalize(args: argparse.Namespace) -> int:
     heap_summary = session_heap_summary(state)
     if heap_summary is not None:
         result["heap"] = heap_summary
+    _write_output(result, args.output)
+    return 0
+
+
+def _consensus_finalize_scudo(state: dict, args: argparse.Namespace) -> int:
+    """Report an Android Scudo collect session's contents.
+
+    Scudo chunk alignment is cohort-global and needs a reference dump to pick
+    per-run chunks, which search-reduce supplies; finalize therefore reports
+    only what has been collected (allocator, cohort, the dump paths). Run
+    ``search-reduce --state <this> --reference-dump <one of them> -o
+    candidates.json`` to produce the candidates.
+    """
+    dump_paths = list(state.get("dump_paths") or [])
+    result = {
+        "mode": STATE_MODE_SCUDO,
+        "allocator": state.get("allocator", "scudo"),
+        "num_dumps": int(state.get("num_dumps", len(dump_paths))),
+        "dump_paths": dump_paths,
+    }
+    if state.get("cohort") is not None:
+        result["cohort"] = state["cohort"]
     _write_output(result, args.output)
     return 0
 

@@ -147,8 +147,10 @@ def emit_plugin_for_hit(
     if not nb_variance:
         raise ValueError(
             f"hit at offset 0x{int(hit['offset']):x} has no neighborhood "
-            f"variance; re-run brute-force with --state so the Welford "
-            f"slice is attached"
+            f"variance; re-run brute-force with the --state of a generic "
+            f"(Welford) session so the slice is attached. A hit from the "
+            f"Android Scudo method has none: plugin generation is not "
+            f"supported yet with that method"
         )
     nb_end = nb_start + len(nb_variance)
     if nb_end > len(reference_data):

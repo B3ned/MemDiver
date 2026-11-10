@@ -288,6 +288,12 @@ masked.
 (default `auto`) next to `--heap-policy`. Only ptmalloc2 (glibc) heap roles feed
 the reduction; another detected allocator reports `unsupported_allocator`.
 
+Android Scudo dumps taken across cold boots use a different method, because
+Scudo re-places every chunk each run and byte positions do not line up. That
+path pairs heap chunks by allocator signature and content instead of reading
+heap roles; see
+[Android Scudo heaps across cold boots](../quickstart/cli.md#android-scudo-heaps-across-cold-boots).
+
 The heap roles come from one of two sources:
 
 - **session** (preferred): `consensus-begin --allocator auto|ptmalloc2` makes

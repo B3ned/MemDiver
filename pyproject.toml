@@ -553,6 +553,10 @@ files = [
     "engine/heap_hits.py",
     "app/_pipeline_heap.py",
     "app/welford_heap.py",
+    # The Android Scudo chunk-signature reduction.
+    "engine/scudo_chunk_consensus.py",
+    "engine/scudo_candidates.py",
+    "app/tools_pipeline_android.py",
     # Wave 14 -- the ISF and key-finder tool layers (1.0.7), back-filled once
     # their three remaining errors (Optional narrowing) were fixed.
     "app/tools_isf.py",
